@@ -138,6 +138,12 @@ def deletion():
     return '', 200
 
 if __name__ == '__main__':
-    scanner_thread = threading.Thread(target=scan, daemon=True)
-    scanner_thread.start()
-    app.run(host='0.0.0.0', port=10000)
+    def start_scanner():
+        scanner_thread = threading.Thread(target=scan, daemon=True)
+        scanner_thread.start()
+    
+    # This runs whether started by Gunicorn or directly
+    start_scanner()
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=10000)
