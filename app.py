@@ -29,11 +29,12 @@ def _require(name):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
-EBAY_APP_ID      = _require("EBAY_APP_ID")
-EBAY_CERT_ID     = _require("EBAY_CERT_ID")
-DISCORD_WEBHOOK  = _require("DISCORD_WEBHOOK")
-DISCORD_BOT_TOKEN = _require("DISCORD_BOT_TOKEN")
+EBAY_APP_ID        = _require("EBAY_APP_ID")
+EBAY_CERT_ID       = _require("EBAY_CERT_ID")
+DISCORD_WEBHOOK    = _require("DISCORD_WEBHOOK")
+DISCORD_BOT_TOKEN  = _require("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID = int(_require("DISCORD_CHANNEL_ID"))
+DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
 
 # --- Stats ---
 stats = {
@@ -75,7 +76,7 @@ def get_access_token() -> str:
     r.raise_for_status()
     return r.json()["access_token"]
 
-# --- Discord webhook (for alerts) ---
+# --- Discord webhook (alerts) ---
 def _discord(payload: dict, retries: int = 3):
     for attempt in range(retries):
         try:
@@ -87,9 +88,26 @@ def _discord(payload: dict, retries: int = 3):
             r.raise_for_status()
             return
         except Exception as e:
-            print(f"Discord error (attempt {attempt + 1}): {e}")
+            print(f"Discord webhook error (attempt {attempt + 1}): {e}")
             time.sleep(2 ** attempt)
 
+# --- Discord bot log channel ---
+_bot_loop: asyncio.AbstractEventLoop | None = None
+
+def _log(message: str):
+    print(message)
+    if _bot_loop is None:
+        return
+    async def _send():
+        try:
+            ch = bot.get_channel(DISCORD_LOG_CHANNEL_ID)
+            if ch:
+                await ch.send(message)
+        except Exception as e:
+            print(f"Log send error: {e}")
+    asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
+
+# --- Alerts ---
 def send_startup_message():
     _discord({
         "embeds": [{
@@ -98,6 +116,7 @@ def send_startup_message():
             "color": 0x00FF00,
         }]
     })
+    _log("🟢 Scanner started.")
 
 def send_alert(title: str, price: float, url: str, tier: str):
     if tier == "fire":
@@ -117,6 +136,7 @@ def send_alert(title: str, price: float, url: str, tier: str):
         }]
     })
     stats["alerts_sent"] += 1
+    _log(f"🔔 Alert sent: {title} — ${price:.2f}")
 
 def build_status_embed() -> dict:
     uptime = int(time.time() - stats["started_at"])
@@ -127,10 +147,10 @@ def build_status_embed() -> dict:
             "title": "📊 Scanner Status",
             "color": 0x5865F2,
             "fields": [
-                {"name": "Uptime",       "value": f"{hours}h {minutes}m",      "inline": True},
-                {"name": "Scans Run",    "value": str(stats["scans"]),          "inline": True},
-                {"name": "Items Found",  "value": str(stats["items_found"]),    "inline": True},
-                {"name": "Alerts Sent",  "value": str(stats["alerts_sent"]),    "inline": True},
+                {"name": "Uptime",      "value": f"{hours}h {minutes}m",   "inline": True},
+                {"name": "Scans Run",   "value": str(stats["scans"]),       "inline": True},
+                {"name": "Items Found", "value": str(stats["items_found"]), "inline": True},
+                {"name": "Alerts Sent", "value": str(stats["alerts_sent"]), "inline": True},
             ],
         }]
     }
@@ -159,8 +179,9 @@ def scan():
 
     try:
         token = get_access_token()
+        _log("✅ eBay token acquired.")
     except Exception as e:
-        print(f"Fatal: could not get initial eBay token: {e}")
+        _log(f"❌ Fatal: could not get initial eBay token: {e}")
         return
 
     token_time = time.time()
@@ -171,11 +192,13 @@ def scan():
             try:
                 token = get_access_token()
                 token_time = time.time()
+                _log("🔄 eBay token refreshed.")
             except Exception as e:
-                print(f"Token refresh failed: {e}")
+                _log(f"⚠️ Token refresh failed: {e}")
 
         if time.time() - last_status >= STATUS_INTERVAL:
             _discord(build_status_embed())
+            _log("📊 Hourly status posted.")
             last_status = time.time()
 
         try:
@@ -195,6 +218,7 @@ def scan():
 
             stats["scans"] += 1
             dirty = False
+            new_this_cycle = 0
 
             for item in r.json().get("itemSummaries", []):
                 item_id = item.get("itemId")
@@ -203,6 +227,7 @@ def scan():
 
                 SEEN_LISTINGS.add(item_id)
                 stats["items_found"] += 1
+                new_this_cycle += 1
                 dirty = True
 
                 title = item.get("title", "")
@@ -217,11 +242,14 @@ def scan():
                 elif _is_32gb_kit(title) and price <= 500:
                     send_alert(title, price, url, "fire")
 
+            if new_this_cycle:
+                _log(f"🔍 Scan #{stats['scans']}: {new_this_cycle} new item(s) found.")
+
             if dirty:
                 _save_seen(SEEN_LISTINGS)
 
         except Exception as e:
-            print(f"Scan error: {e}")
+            _log(f"❌ Scan error: {e}")
 
         time.sleep(SCAN_INTERVAL)
 
@@ -237,6 +265,8 @@ async def status_command(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
+    global _bot_loop
+    _bot_loop = asyncio.get_event_loop()
     await tree.sync()
     print(f"Bot logged in as {bot.user}")
 
@@ -258,8 +288,8 @@ def deletion():
     return "", 200
 
 # --- Startup ---
-threading.Thread(target=scan, daemon=True).start()
 threading.Thread(target=run_bot, daemon=True).start()
+threading.Thread(target=scan, daemon=True).start()
 send_startup_message()
 
 if __name__ == "__main__":
