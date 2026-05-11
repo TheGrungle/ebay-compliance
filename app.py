@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -5,6 +6,8 @@ import os
 import threading
 import time
 
+import discord
+from discord import app_commands
 import requests
 from flask import Flask, request, jsonify
 
@@ -17,6 +20,7 @@ SEEN_FILE = "seen_listings.json"
 MAX_SEEN = 5000
 SCAN_INTERVAL = 30
 TOKEN_TTL = 5400  # 90 minutes
+STATUS_INTERVAL = 3600  # 60 minutes
 
 # --- Env vars (fail fast if missing) ---
 def _require(name):
@@ -25,9 +29,19 @@ def _require(name):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
-EBAY_APP_ID     = _require("EBAY_APP_ID")
-EBAY_CERT_ID    = _require("EBAY_CERT_ID")
-DISCORD_WEBHOOK = _require("DISCORD_WEBHOOK")
+EBAY_APP_ID      = _require("EBAY_APP_ID")
+EBAY_CERT_ID     = _require("EBAY_CERT_ID")
+DISCORD_WEBHOOK  = _require("DISCORD_WEBHOOK")
+DISCORD_BOT_TOKEN = _require("DISCORD_BOT_TOKEN")
+DISCORD_CHANNEL_ID = int(_require("DISCORD_CHANNEL_ID"))
+
+# --- Stats ---
+stats = {
+    "scans": 0,
+    "items_found": 0,
+    "alerts_sent": 0,
+    "started_at": time.time(),
+}
 
 # --- Seen listings (persisted to disk) ---
 def _load_seen():
@@ -61,7 +75,7 @@ def get_access_token() -> str:
     r.raise_for_status()
     return r.json()["access_token"]
 
-# --- Discord ---
+# --- Discord webhook (for alerts) ---
 def _discord(payload: dict, retries: int = 3):
     for attempt in range(retries):
         try:
@@ -102,6 +116,24 @@ def send_alert(title: str, price: float, url: str, tier: str):
             ],
         }]
     })
+    stats["alerts_sent"] += 1
+
+def build_status_embed() -> dict:
+    uptime = int(time.time() - stats["started_at"])
+    hours, rem = divmod(uptime, 3600)
+    minutes = rem // 60
+    return {
+        "embeds": [{
+            "title": "📊 Scanner Status",
+            "color": 0x5865F2,
+            "fields": [
+                {"name": "Uptime",       "value": f"{hours}h {minutes}m",      "inline": True},
+                {"name": "Scans Run",    "value": str(stats["scans"]),          "inline": True},
+                {"name": "Items Found",  "value": str(stats["items_found"]),    "inline": True},
+                {"name": "Alerts Sent",  "value": str(stats["alerts_sent"]),    "inline": True},
+            ],
+        }]
+    }
 
 # --- Listing classification ---
 _EXCLUSIONS = [
@@ -113,16 +145,13 @@ _KIT_16 = ["2x16", "2 x 16", "32gb kit", "32 gb kit", "dual 16", "16gbx2", "16gb
 _KIT_32 = ["2x32", "2 x 32", "64gb kit", "64 gb kit", "dual 32", "32gbx2", "32gb x2"]
 
 def _excluded(title: str) -> bool:
-    t = title.lower()
-    return any(x in t for x in _EXCLUSIONS)
+    return any(x in title.lower() for x in _EXCLUSIONS)
 
 def _is_16gb_kit(title: str) -> bool:
-    t = title.lower()
-    return any(x in t for x in _KIT_16)
+    return any(x in title.lower() for x in _KIT_16)
 
 def _is_32gb_kit(title: str) -> bool:
-    t = title.lower()
-    return any(x in t for x in _KIT_32)
+    return any(x in title.lower() for x in _KIT_32)
 
 # --- Scanner loop ---
 def scan():
@@ -135,6 +164,7 @@ def scan():
         return
 
     token_time = time.time()
+    last_status = time.time()
 
     while True:
         if time.time() - token_time > TOKEN_TTL:
@@ -143,6 +173,10 @@ def scan():
                 token_time = time.time()
             except Exception as e:
                 print(f"Token refresh failed: {e}")
+
+        if time.time() - last_status >= STATUS_INTERVAL:
+            _discord(build_status_embed())
+            last_status = time.time()
 
         try:
             r = requests.get(
@@ -159,13 +193,16 @@ def scan():
             )
             r.raise_for_status()
 
+            stats["scans"] += 1
             dirty = False
+
             for item in r.json().get("itemSummaries", []):
                 item_id = item.get("itemId")
                 if item_id in SEEN_LISTINGS:
                     continue
 
                 SEEN_LISTINGS.add(item_id)
+                stats["items_found"] += 1
                 dirty = True
 
                 title = item.get("title", "")
@@ -188,6 +225,26 @@ def scan():
 
         time.sleep(SCAN_INTERVAL)
 
+# --- Discord bot ---
+intents = discord.Intents.default()
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
+
+@tree.command(name="status", description="Get current RAM scanner stats")
+async def status_command(interaction: discord.Interaction):
+    _discord(build_status_embed())
+    await interaction.response.send_message("Status posted!", ephemeral=True)
+
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"Bot logged in as {bot.user}")
+
+def run_bot():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot.start(DISCORD_BOT_TOKEN))
+
 # --- eBay compliance endpoint ---
 @app.route("/ebay-deletion", methods=["GET", "POST"])
 def deletion():
@@ -200,8 +257,9 @@ def deletion():
         return jsonify({"challengeResponse": m.hexdigest()}), 200
     return "", 200
 
-# --- Startup (runs for both Gunicorn and direct execution) ---
+# --- Startup ---
 threading.Thread(target=scan, daemon=True).start()
+threading.Thread(target=run_bot, daemon=True).start()
 send_startup_message()
 
 if __name__ == "__main__":
