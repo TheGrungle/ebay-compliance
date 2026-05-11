@@ -17,23 +17,30 @@ app = Flask(__name__)
 VERIFICATION_TOKEN = "qawfjoewjfoiewfsadfjjwqoifjewoifjoiwjfluhojflanfmdnugjwoiqjfnewfow"
 ENDPOINT = "https://ebay-compliance-5902.onrender.com/ebay-deletion"
 SEEN_FILE = "seen_listings.json"
+SEARCHES_FILE = "searches.json"
 MAX_SEEN = 5000
 SCAN_INTERVAL = 30
-TOKEN_TTL = 5400  # 90 minutes
-STATUS_INTERVAL = 3600  # 60 minutes
+TOKEN_TTL = 5400
+STATUS_INTERVAL = 3600
 
-# --- Env vars (fail fast if missing) ---
+EXCLUSIONS = [
+    "ecc", "server", "apple", "mac", "macbook", "rdimm", "lrdimm",
+    "for parts", "parts only", "not working", "as is",
+    "ddr5", "ddr3", "ddr2", "sodimm",
+]
+
+# --- Env vars ---
 def _require(name):
     val = os.environ.get(name)
     if not val:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
-EBAY_APP_ID        = _require("EBAY_APP_ID")
-EBAY_CERT_ID       = _require("EBAY_CERT_ID")
-DISCORD_WEBHOOK    = _require("DISCORD_WEBHOOK")
-DISCORD_BOT_TOKEN  = _require("DISCORD_BOT_TOKEN")
-DISCORD_CHANNEL_ID = int(_require("DISCORD_CHANNEL_ID"))
+EBAY_APP_ID            = _require("EBAY_APP_ID")
+EBAY_CERT_ID           = _require("EBAY_CERT_ID")
+DISCORD_WEBHOOK        = _require("DISCORD_WEBHOOK")
+DISCORD_BOT_TOKEN      = _require("DISCORD_BOT_TOKEN")
+DISCORD_CHANNEL_ID     = int(_require("DISCORD_CHANNEL_ID"))
 DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
 
 # --- Stats ---
@@ -44,7 +51,21 @@ stats = {
     "started_at": time.time(),
 }
 
-# --- Seen listings (persisted to disk) ---
+# --- Searches config ---
+_searches_lock = threading.Lock()
+
+def load_searches() -> list:
+    try:
+        with open(SEARCHES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_searches(searches: list):
+    with open(SEARCHES_FILE, "w") as f:
+        json.dump(searches, f, indent=2)
+
+# --- Seen listings ---
 def _load_seen():
     try:
         with open(SEEN_FILE) as f:
@@ -76,22 +97,21 @@ def get_access_token() -> str:
     r.raise_for_status()
     return r.json()["access_token"]
 
-# --- Discord webhook (alerts) ---
+# --- Discord webhook ---
 def _discord(payload: dict, retries: int = 3):
     for attempt in range(retries):
         try:
             r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
             if r.status_code == 429:
-                wait = r.json().get("retry_after", 1)
-                time.sleep(wait)
+                time.sleep(r.json().get("retry_after", 1))
                 continue
             r.raise_for_status()
             return
         except Exception as e:
-            print(f"Discord webhook error (attempt {attempt + 1}): {e}")
+            print(f"Webhook error (attempt {attempt + 1}): {e}")
             time.sleep(2 ** attempt)
 
-# --- Discord bot log channel ---
+# --- Bot log channel ---
 _bot_loop: asyncio.AbstractEventLoop | None = None
 
 def _log(message: str):
@@ -109,71 +129,62 @@ def _log(message: str):
 
 # --- Alerts ---
 def send_startup_message():
+    searches = load_searches()
+    lines = "\n".join(f"• **{s['name']}** — max ${s['max_price']}" for s in searches) or "No searches configured."
     _discord({
         "embeds": [{
             "title": "🟢 RAM Scanner is live",
-            "description": "Scanning every 30 seconds for DDR4 deals.\n⚡ 2x16 ≤ $70\n🔥 2x32 ≤ $150",
+            "description": f"Scanning every 30 seconds.\n\n**Active searches:**\n{lines}",
             "color": 0x00FF00,
         }]
     })
     _log("🟢 Scanner started.")
 
-def send_alert(title: str, price: float, url: str, tier: str):
-    if tier == "fire":
-        label, color = "🔥 2x32 DDR4 — $150 or under", 0xFF4500
-    else:
-        label, color = "⚡ 2x16 DDR4 — $70 or under", 0x00BFFF
-
+def send_alert(title: str, price: float, url: str, search: dict):
     _discord({
         "embeds": [{
             "title": title,
             "url": url,
-            "color": color,
+            "color": search.get("color", 0x00BFFF),
             "fields": [
-                {"name": "Price", "value": f"${price:.2f}", "inline": True},
-                {"name": "Deal Tier", "value": label, "inline": True},
+                {"name": "Price",     "value": f"${price:.2f}",            "inline": True},
+                {"name": "Deal Tier", "value": search.get("label", "Deal"), "inline": True},
+                {"name": "Search",    "value": search["name"],              "inline": True},
             ],
         }]
     })
     stats["alerts_sent"] += 1
-    _log(f"🔔 Alert sent: {title} — ${price:.2f}")
+    _log(f"🔔 Alert: [{search['name']}] {title} — ${price:.2f}")
 
 def build_status_embed() -> dict:
     uptime = int(time.time() - stats["started_at"])
     hours, rem = divmod(uptime, 3600)
     minutes = rem // 60
+    searches = load_searches()
     return {
         "embeds": [{
             "title": "📊 Scanner Status",
             "color": 0x5865F2,
             "fields": [
-                {"name": "Uptime",      "value": f"{hours}h {minutes}m",   "inline": True},
-                {"name": "Scans Run",   "value": str(stats["scans"]),       "inline": True},
-                {"name": "Items Found", "value": str(stats["items_found"]), "inline": True},
-                {"name": "Alerts Sent", "value": str(stats["alerts_sent"]), "inline": True},
+                {"name": "Uptime",          "value": f"{hours}h {minutes}m",    "inline": True},
+                {"name": "Scans Run",       "value": str(stats["scans"]),        "inline": True},
+                {"name": "Items Found",     "value": str(stats["items_found"]),  "inline": True},
+                {"name": "Alerts Sent",     "value": str(stats["alerts_sent"]),  "inline": True},
+                {"name": "Active Searches", "value": str(len(searches)),         "inline": True},
             ],
         }]
     }
 
-# --- Listing classification ---
-_EXCLUSIONS = [
-    "ecc", "server", "apple", "mac", "macbook", "rdimm", "lrdimm",
-    "for parts", "parts only", "not working", "as is",
-    "ddr5", "ddr3", "ddr2", "sodimm",
-]
-_KIT_16 = ["2x16", "2 x 16", "32gb kit", "32 gb kit", "dual 16", "16gbx2", "16gb x2"]
-_KIT_32 = ["2x32", "2 x 32", "64gb kit", "64 gb kit", "dual 32", "32gbx2", "32gb x2"]
+# --- Scanner ---
+def _matches(title: str, search: dict) -> bool:
+    t = title.lower()
+    if any(x in t for x in EXCLUSIONS):
+        return False
+    must = search.get("must_contain", [])
+    if must and not any(k.lower() in t for k in must):
+        return False
+    return True
 
-def _excluded(title: str) -> bool:
-    return any(x in title.lower() for x in _EXCLUSIONS)
-
-def _is_16gb_kit(title: str) -> bool:
-    return any(x in title.lower() for x in _KIT_16)
-
-def _is_32gb_kit(title: str) -> bool:
-    return any(x in title.lower() for x in _KIT_32)
-
-# --- Scanner loop ---
 def scan():
     global SEEN_LISTINGS
 
@@ -201,55 +212,54 @@ def scan():
             _log("📊 Hourly status posted.")
             last_status = time.time()
 
-        try:
-            r = requests.get(
-                "https://api.ebay.com/buy/browse/v1/item_summary/search",
-                headers={"Authorization": f"Bearer {token}"},
-                params={
-                    "q": "DDR4 RAM 2x16 OR 2x32 OR 32gb kit OR 64gb kit",
-                    "category_ids": "170083",
-                    "filter": "price:[..500],priceCurrency:USD,conditions:{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}",
-                    "sort": "newlyListed",
-                    "limit": "50",
-                },
-                timeout=15,
-            )
-            r.raise_for_status()
+        with _searches_lock:
+            searches = load_searches()
 
-            stats["scans"] += 1
-            dirty = False
-            new_this_cycle = 0
+        stats["scans"] += 1
+        dirty = False
+        new_this_cycle = 0
 
-            for item in r.json().get("itemSummaries", []):
-                item_id = item.get("itemId")
-                if item_id in SEEN_LISTINGS:
-                    continue
+        for search in searches:
+            try:
+                r = requests.get(
+                    "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={
+                        "q": search["query"],
+                        "category_ids": search.get("category_id", "170083"),
+                        "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
+                        "sort": "newlyListed",
+                        "limit": "50",
+                    },
+                    timeout=15,
+                )
+                r.raise_for_status()
 
-                SEEN_LISTINGS.add(item_id)
-                stats["items_found"] += 1
-                new_this_cycle += 1
-                dirty = True
+                for item in r.json().get("itemSummaries", []):
+                    item_id = item.get("itemId")
+                    if item_id in SEEN_LISTINGS:
+                        continue
 
-                title = item.get("title", "")
-                price = float(item.get("price", {}).get("value", 999))
-                url   = item.get("itemWebUrl", "")
+                    SEEN_LISTINGS.add(item_id)
+                    stats["items_found"] += 1
+                    new_this_cycle += 1
+                    dirty = True
 
-                if _excluded(title):
-                    continue
+                    title = item.get("title", "")
+                    price = float(item.get("price", {}).get("value", 999))
+                    url   = item.get("itemWebUrl", "")
 
-                if _is_16gb_kit(title) and price <= 500:
-                    send_alert(title, price, url, "budget")
-                elif _is_32gb_kit(title) and price <= 500:
-                    send_alert(title, price, url, "fire")
+                    if _matches(title, search):
+                        send_alert(title, price, url, search)
 
-            if new_this_cycle:
-                _log(f"🔍 Scan #{stats['scans']}: {new_this_cycle} new item(s) found.")
+            except Exception as e:
+                _log(f"❌ Scan error [{search['name']}]: {e}")
 
-            if dirty:
-                _save_seen(SEEN_LISTINGS)
+        if new_this_cycle:
+            _log(f"🔍 Scan #{stats['scans']}: {new_this_cycle} new item(s) across {len(searches)} search(es).")
 
-        except Exception as e:
-            _log(f"❌ Scan error: {e}")
+        if dirty:
+            _save_seen(SEEN_LISTINGS)
 
         time.sleep(SCAN_INTERVAL)
 
@@ -258,10 +268,77 @@ intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
+search_group = app_commands.Group(name="search", description="Manage eBay searches")
+
+@search_group.command(name="list", description="List all active searches")
+async def search_list(interaction: discord.Interaction):
+    searches = load_searches()
+    if not searches:
+        await interaction.response.send_message("No searches configured.", ephemeral=True)
+        return
+    lines = []
+    for i, s in enumerate(searches):
+        must = ", ".join(s.get("must_contain", [])) or "any"
+        lines.append(f"**{i+1}. {s['name']}**\nQuery: `{s['query']}`\nMax: ${s['max_price']} | Keywords: {must}\n")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+@search_group.command(name="add", description="Add a new search")
+@app_commands.describe(
+    name="Friendly name for this search",
+    query="eBay search query",
+    max_price="Maximum price",
+    must_contain="Comma-separated title keywords (any match required, optional)",
+    label="Alert label text (optional)",
+    color="Embed color as hex integer (optional, default 49151)",
+)
+async def search_add(
+    interaction: discord.Interaction,
+    name: str,
+    query: str,
+    max_price: float,
+    must_contain: str = "",
+    label: str = "",
+    color: int = 49151,
+):
+    with _searches_lock:
+        searches = load_searches()
+        if any(s["name"].lower() == name.lower() for s in searches):
+            await interaction.response.send_message(f"A search named **{name}** already exists.", ephemeral=True)
+            return
+        searches.append({
+            "name": name,
+            "query": query,
+            "category_id": "170083",
+            "max_price": max_price,
+            "must_contain": [k.strip() for k in must_contain.split(",") if k.strip()],
+            "label": label or name,
+            "color": color,
+        })
+        save_searches(searches)
+
+    _log(f"➕ Search added: {name} (max ${max_price})")
+    await interaction.response.send_message(f"✅ Search **{name}** added.", ephemeral=True)
+
+@search_group.command(name="remove", description="Remove a search by name")
+@app_commands.describe(name="Name of the search to remove")
+async def search_remove(interaction: discord.Interaction, name: str):
+    with _searches_lock:
+        searches = load_searches()
+        updated = [s for s in searches if s["name"].lower() != name.lower()]
+        if len(updated) == len(searches):
+            await interaction.response.send_message(f"No search named **{name}** found.", ephemeral=True)
+            return
+        save_searches(updated)
+
+    _log(f"➖ Search removed: {name}")
+    await interaction.response.send_message(f"✅ Search **{name}** removed.", ephemeral=True)
+
 @tree.command(name="status", description="Get current RAM scanner stats")
 async def status_command(interaction: discord.Interaction):
     _discord(build_status_embed())
     await interaction.response.send_message("Status posted!", ephemeral=True)
+
+tree.add_command(search_group)
 
 @bot.event
 async def on_ready():
