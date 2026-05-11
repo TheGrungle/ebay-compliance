@@ -385,6 +385,10 @@ async def status_command(interaction: discord.Interaction):
     _discord(build_status_embed())
     await interaction.response.send_message("Status posted!", ephemeral=True)
 
+@tree.command(name="echo", description="Echo")
+async def echo_command(interaction: discord.Interaction):
+    await interaction.response.send_message("echo")
+
 tree.add_command(search_group)
 
 @bot.event
