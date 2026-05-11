@@ -334,6 +334,52 @@ async def search_remove(interaction: discord.Interaction, name: str):
     _log(f"➖ Search removed: {name}")
     await interaction.response.send_message(f"✅ Search **{name}** removed.", ephemeral=True)
 
+@search_group.command(name="edit", description="Edit an existing search")
+@app_commands.describe(
+    name="Name of the search to edit",
+    new_name="New name (optional)",
+    query="New eBay search query (optional)",
+    max_price="New maximum price (optional)",
+    must_contain="New comma-separated keywords (optional)",
+    label="New alert label text (optional)",
+    color="New embed color as decimal integer (optional)",
+)
+async def search_edit(
+    interaction: discord.Interaction,
+    name: str,
+    new_name: str = "",
+    query: str = "",
+    max_price: float = -1,
+    must_contain: str = "",
+    label: str = "",
+    color: int = -1,
+):
+    with _searches_lock:
+        searches = load_searches()
+        match = next((s for s in searches if s["name"].lower() == name.lower()), None)
+        if not match:
+            await interaction.response.send_message(f"No search named **{name}** found.", ephemeral=True)
+            return
+
+        if new_name:
+            match["name"] = new_name
+        if query:
+            match["query"] = query
+        if max_price >= 0:
+            match["max_price"] = max_price
+        if must_contain:
+            match["must_contain"] = [k.strip() for k in must_contain.split(",") if k.strip()]
+        if label:
+            match["label"] = label
+        if color >= 0:
+            match["color"] = color
+
+        save_searches(searches)
+
+    display = new_name or name
+    _log(f"✏️ Search edited: {name} → {display}")
+    await interaction.response.send_message(f"✅ Search **{display}** updated.", ephemeral=True)
+
 @tree.command(name="status", description="Get current RAM scanner stats")
 async def status_command(interaction: discord.Interaction):
     _discord(build_status_embed())
