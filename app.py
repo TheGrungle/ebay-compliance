@@ -42,6 +42,7 @@ DISCORD_WEBHOOK        = _require("DISCORD_WEBHOOK")
 DISCORD_BOT_TOKEN      = _require("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID     = int(_require("DISCORD_CHANNEL_ID"))
 DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
+DISCORD_GUILD_ID       = int(_require("DISCORD_GUILD_ID"))
 
 # --- Stats ---
 stats = {
@@ -344,8 +345,10 @@ tree.add_command(search_group)
 async def on_ready():
     global _bot_loop
     _bot_loop = asyncio.get_event_loop()
-    await tree.sync()
-    print(f"Bot logged in as {bot.user}")
+    guild = discord.Object(id=DISCORD_GUILD_ID)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+    print(f"Bot logged in as {bot.user} — commands synced to guild")
 
 def run_bot():
     loop = asyncio.new_event_loop()
