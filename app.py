@@ -151,7 +151,7 @@ def scan():
                 params={
                     "q": "DDR4 RAM 2x16 OR 2x32 OR 32gb kit OR 64gb kit",
                     "category_ids": "170083",
-                    "filter": "price:[..150],priceCurrency:USD,conditions:{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}",
+                    "filter": "price:[..500],priceCurrency:USD,conditions:{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}",
                     "sort": "newlyListed",
                     "limit": "50",
                 },
@@ -175,9 +175,9 @@ def scan():
                 if _excluded(title):
                     continue
 
-                if _is_16gb_kit(title) and price <= 70:
+                if _is_16gb_kit(title) and price <= 500:
                     send_alert(title, price, url, "budget")
-                elif _is_32gb_kit(title) and price <= 150:
+                elif _is_32gb_kit(title) and price <= 500:
                     send_alert(title, price, url, "fire")
 
             if dirty:
