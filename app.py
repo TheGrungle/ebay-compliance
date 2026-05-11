@@ -345,6 +345,8 @@ tree.add_command(search_group)
 async def on_ready():
     global _bot_loop
     _bot_loop = asyncio.get_event_loop()
+    tree.clear_commands(guild=None)
+    await tree.sync()
     guild = discord.Object(id=DISCORD_GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
