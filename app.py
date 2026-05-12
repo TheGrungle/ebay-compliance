@@ -148,10 +148,13 @@ def _add_seen(item_id):
 
 SEEN_LISTINGS = _load_seen()
 
+# --- HTTP session (keep-alive saves ~200ms per call) ---
+_http = requests.Session()
+
 # --- eBay auth ---
 def get_access_token():
     creds = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
-    r = requests.post(
+    r = _http.post(
         "https://api.ebay.com/identity/v1/oauth2/token",
         headers={
             "Authorization": f"Basic {creds}",
@@ -307,9 +310,70 @@ def _matches(title, search):
         return False
     return True
 
-def scan():
-    global SEEN_LISTINGS
+def _fetch_search(token, search):
+    """Network-only: hit eBay for one search. Runs in a worker thread.
+       Returns (search, items, error)."""
+    params = {
+        "q": search["query"],
+        "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
+        "sort": "newlyListed",
+        "limit": "50",
+        "fieldgroups": "EXTENDED",
+    }
+    if search.get("category_id"):
+        params["category_ids"] = search["category_id"]
 
+    try:
+        record_api_call()
+        r = _http.get(
+            "https://api.ebay.com/buy/browse/v1/item_summary/search",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return search, r.json().get("itemSummaries", []), None
+    except Exception as e:
+        return search, [], e
+
+def _process_results(search, items):
+    """Filter, dedupe, alert. Runs in the main scanner thread (single-threaded)."""
+    new_count = 0
+    for item in items:
+        item_id = item.get("itemId")
+        title = item.get("title", "")
+        price_val = item.get("price", {}).get("value")
+        price = float(price_val) if price_val is not None else NO_PRICE
+
+        if debug_mode:
+            seen = item_id in SEEN_LISTINGS
+            matches = _matches(title, search)
+            _log(
+                f"[DEBUG][{search['name']}] {'SEEN' if seen else 'NEW'} | "
+                f"{'MATCH' if matches else 'NO MATCH'} | "
+                f"${price:.2f} | {title[:60]}"
+            )
+
+        if item_id in SEEN_LISTINGS:
+            continue
+
+        _add_seen(item_id)
+        new_count += 1
+
+        url = item.get("itemWebUrl", "")
+
+        age_secs = get_listing_age_seconds(item)
+        if age_secs is not None and age_secs > MAX_LISTING_AGE:
+            if debug_mode:
+                _log(f"[DEBUG][{search['name']}] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
+            continue
+
+        if _matches(title, search):
+            send_alert(title, price, url, search, item)
+
+    return new_count
+
+def scan():
     try:
         token = get_access_token()
         _log("✅ eBay token acquired.")
@@ -322,6 +386,8 @@ def scan():
     last_polled = {}  # search name -> last poll timestamp
 
     while True:
+        cycle_start = time.time()
+
         if paused:
             time.sleep(SCAN_INTERVAL)
             continue
@@ -342,84 +408,36 @@ def scan():
         with _searches_lock:
             searches = load_searches()
 
-        dirty = False
         new_this_cycle = 0
+        dirty = False
         now = time.time()
 
         for search in searches:
             poll_interval = search.get("poll_interval", SCAN_INTERVAL)
-            last = last_polled.get(search["name"], 0)
-            if now - last < poll_interval:
-                continue  # not time yet for this search
-
+            if now - last_polled.get(search["name"], 0) < poll_interval:
+                continue
             last_polled[search["name"]] = now
 
-            try:
-                params = {
-                    "q": search["query"],
-                    "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
-                    "sort": "newlyListed",
-                    "limit": "50",
-                    "fieldgroups": "EXTENDED",
-                }
-                if search.get("category_id"):
-                    params["category_ids"] = search["category_id"]
+            stats["last_scan_at"] = time.time()
+            _, items, err = _fetch_search(token, search)
+            if err:
+                _log(f"❌ Scan error [{search['name']}]: {err}")
+                continue
 
-                # Count the call BEFORE we know if it succeeded — failed calls still cost quota
-                record_api_call()
-                stats["last_scan_at"] = time.time()
-                r = requests.get(
-                    "https://api.ebay.com/buy/browse/v1/item_summary/search",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params=params,
-                    timeout=15,
-                )
-                r.raise_for_status()
-
-                for item in r.json().get("itemSummaries", []):
-                    item_id = item.get("itemId")
-                    title = item.get("title", "")
-                    price_val = item.get("price", {}).get("value")
-                    price = float(price_val) if price_val is not None else NO_PRICE
-
-                    if debug_mode:
-                        seen = item_id in SEEN_LISTINGS
-                        matches = _matches(title, search)
-                        _log(
-                            f"[DEBUG][{search['name']}] {'SEEN' if seen else 'NEW'} | "
-                            f"{'MATCH' if matches else 'NO MATCH'} | "
-                            f"${price:.2f} | {title[:60]}"
-                        )
-
-                    if item_id in SEEN_LISTINGS:
-                        continue
-
-                    _add_seen(item_id)
-                    new_this_cycle += 1
-                    dirty = True
-
-                    url = item.get("itemWebUrl", "")
-
-                    # Skip items older than 24 hours
-                    age_secs = get_listing_age_seconds(item)
-                    if age_secs is not None and age_secs > MAX_LISTING_AGE:
-                        if debug_mode:
-                            _log(f"[DEBUG][{search['name']}] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
-                        continue
-
-                    if _matches(title, search):
-                        send_alert(title, price, url, search, item)
-
-            except Exception as e:
-                _log(f"❌ Scan error [{search['name']}]: {e}")
+            count = _process_results(search, items)
+            if count:
+                dirty = True
+                new_this_cycle += count
 
         if new_this_cycle:
-            _log(f"🔍 {new_this_cycle} new item(s) across {len(searches)} search(es).")
+            _log(f"🔍 {new_this_cycle} new item(s).")
 
         if dirty:
             _save_seen(SEEN_LISTINGS)
 
-        time.sleep(SCAN_INTERVAL)
+        # Tight sleep: keep cycle start-to-start ~exactly SCAN_INTERVAL, never longer
+        elapsed = time.time() - cycle_start
+        time.sleep(max(0, SCAN_INTERVAL - elapsed))
 
 # --- Discord bot ---
 intents = discord.Intents.default()
