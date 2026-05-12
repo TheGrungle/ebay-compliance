@@ -260,8 +260,14 @@ def build_status_embed():
 # --- Scanner ---
 def _matches(title, search):
     t = title.lower()
-    if any(x in t for x in EXCLUSIONS):
-        return False
+    # Global RAM exclusions only apply if this is a RAM-category search
+    if search.get("category_id") == "170083":
+        if any(x in t for x in EXCLUSIONS):
+            return False
+    # Per-search exclusions apply to all searches
+    for x in search.get("exclude", []):
+        if x.lower() in t:
+            return False
     must = search.get("must_contain", [])
     if must and not any(k.lower() in t for k in must):
         return False
@@ -312,17 +318,20 @@ def scan():
             last_polled[search["name"]] = now
 
             try:
+                params = {
+                    "q": search["query"],
+                    "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
+                    "sort": "newlyListed",
+                    "limit": "50",
+                    "fieldgroups": "EXTENDED",
+                }
+                if search.get("category_id"):
+                    params["category_ids"] = search["category_id"]
+
                 r = requests.get(
                     "https://api.ebay.com/buy/browse/v1/item_summary/search",
                     headers={"Authorization": f"Bearer {token}"},
-                    params={
-                        "q": search["query"],
-                        "category_ids": search.get("category_id", "170083"),
-                        "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
-                        "sort": "newlyListed",
-                        "limit": "50",
-                        "fieldgroups": "EXTENDED",
-                    },
+                    params=params,
                     timeout=15,
                 )
                 r.raise_for_status()
@@ -394,6 +403,7 @@ async def search_list(interaction: discord.Interaction):
     label="Alert label text (optional)",
     color="Embed color as decimal integer (optional, default 49151)",
     poll_interval="How often to poll in seconds, multiples of 30 (optional, default 30)",
+    category_id="eBay category ID (optional - leave blank to search all categories)",
 )
 async def search_add(
     interaction: discord.Interaction,
@@ -404,6 +414,7 @@ async def search_add(
     label: str = "",
     color: int = 49151,
     poll_interval: int = 30,
+    category_id: str = "",
 ):
     poll_interval = max(30, (poll_interval // 30) * 30)
     with _searches_lock:
@@ -411,19 +422,22 @@ async def search_add(
         if any(s["name"].lower() == name.lower() for s in searches):
             await interaction.response.send_message(f"A search named **{name}** already exists.", ephemeral=True)
             return
-        searches.append({
+        new_search = {
             "name": name,
             "query": query,
-            "category_id": "170083",
             "max_price": max_price,
             "poll_interval": poll_interval,
             "must_contain": [k.strip() for k in must_contain.split(",") if k.strip()],
             "label": label or name,
             "color": color,
-        })
+        }
+        if category_id:
+            new_search["category_id"] = category_id
+        searches.append(new_search)
         save_searches(searches)
 
-    _log(f"➕ Search added: {name} (max ${max_price}, every {poll_interval}s)")
+    cat_str = f" in category {category_id}" if category_id else " (all categories)"
+    _log(f"➕ Search added: {name} (max ${max_price}, every {poll_interval}s{cat_str})")
     await interaction.response.send_message(f"✅ Search **{name}** added.", ephemeral=True)
 
 @search_group.command(name="remove", description="Remove a search by name")
@@ -450,6 +464,7 @@ async def search_remove(interaction: discord.Interaction, name: str):
     label="New alert label text (optional)",
     color="New embed color as decimal integer (optional)",
     poll_interval="New poll interval in seconds, multiples of 30 (optional)",
+    category_id="New eBay category ID (optional, use 'none' to clear and search all categories)",
 )
 async def search_edit(
     interaction: discord.Interaction,
@@ -461,6 +476,7 @@ async def search_edit(
     label: str = "",
     color: int = None,
     poll_interval: int = None,
+    category_id: str = "",
 ):
     with _searches_lock:
         searches = load_searches()
@@ -482,6 +498,11 @@ async def search_edit(
             match["color"] = color
         if poll_interval is not None:
             match["poll_interval"] = max(30, (poll_interval // 30) * 30)
+        if category_id:
+            if category_id.lower() == "none":
+                match.pop("category_id", None)
+            else:
+                match["category_id"] = category_id
         save_searches(searches)
 
     display = new_name or name
