@@ -162,6 +162,7 @@ def _discord(payload, retries=3):
 
 # --- Bot log channel ---
 _bot_loop = None
+_bot_initialized = False  # prevents duplicate startup work on Discord reconnects
 
 def _log(message):
     print(message)
@@ -530,14 +531,20 @@ tree.add_command(search_group)
 
 @bot.event
 async def on_ready():
-    global _bot_loop
+    global _bot_loop, _bot_initialized
     _bot_loop = asyncio.get_event_loop()
+
+    if _bot_initialized:
+        print(f"[PID {os.getpid()}] on_ready fired again (reconnect) — skipping init")
+        return
+    _bot_initialized = True
+
     guild = discord.Object(id=DISCORD_GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
     tree.clear_commands(guild=None)
     await tree.sync()
-    print(f"Bot logged in as {bot.user}")
+    print(f"[PID {os.getpid()}] Bot logged in as {bot.user}")
     threading.Thread(target=send_startup_message, daemon=True).start()
 
 def run_bot():
