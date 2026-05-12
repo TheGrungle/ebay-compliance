@@ -348,10 +348,10 @@ async def search_edit(
     name: str,
     new_name: str = "",
     query: str = "",
-    max_price: float = -1,
+    max_price: float = None,
     must_contain: str = "",
     label: str = "",
-    color: int = -1,
+    color: int = None,
 ):
     with _searches_lock:
         searches = load_searches()
@@ -363,13 +363,13 @@ async def search_edit(
             match["name"] = new_name
         if query:
             match["query"] = query
-        if max_price >= 0:
+        if max_price is not None:
             match["max_price"] = max_price
         if must_contain:
             match["must_contain"] = [k.strip() for k in must_contain.split(",") if k.strip()]
         if label:
             match["label"] = label
-        if color >= 0:
+        if color is not None:
             match["color"] = color
         save_searches(searches)
 
