@@ -178,23 +178,30 @@ def _log(message):
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
 
 # --- Listing age ---
-def get_listing_age(item):
+MAX_LISTING_AGE = 86400  # 24 hours in seconds
+
+def get_listing_age_seconds(item):
     raw = item.get("itemCreationDate")
     if not raw:
         return None
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        age_secs = int((datetime.now(timezone.utc) - dt).total_seconds())
-        if age_secs < 60:
-            return f"{age_secs}s old"
-        elif age_secs < 3600:
-            return f"{age_secs // 60}m old"
-        else:
-            h = age_secs // 3600
-            m = (age_secs % 3600) // 60
-            return f"{h}h {m}m old"
+        return int((datetime.now(timezone.utc) - dt).total_seconds())
     except Exception:
         return None
+
+def get_listing_age(item):
+    age_secs = get_listing_age_seconds(item)
+    if age_secs is None:
+        return None
+    if age_secs < 60:
+        return f"{age_secs}s old"
+    elif age_secs < 3600:
+        return f"{age_secs // 60}m old"
+    else:
+        h = age_secs // 3600
+        m = (age_secs % 3600) // 60
+        return f"{h}h {m}m old"
 
 # --- Alerts & status ---
 def send_startup_message():
@@ -362,6 +369,13 @@ def scan():
                     dirty = True
 
                     url = item.get("itemWebUrl", "")
+
+                    # Skip items older than 24 hours
+                    age_secs = get_listing_age_seconds(item)
+                    if age_secs is not None and age_secs > MAX_LISTING_AGE:
+                        if debug_mode:
+                            _log(f"[DEBUG][{search['name']}] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
+                        continue
 
                     if _matches(title, search):
                         send_alert(title, price, url, search, item)
