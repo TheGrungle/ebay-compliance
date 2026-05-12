@@ -392,11 +392,11 @@ tree.add_command(search_group)
 async def on_ready():
     global _bot_loop
     _bot_loop = asyncio.get_event_loop()
-    tree.clear_commands(guild=None)
-    await tree.sync()
     guild = discord.Object(id=DISCORD_GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
+    tree.clear_commands(guild=None)
+    await tree.sync()
     print(f"Bot logged in as {bot.user}")
     # Send startup message here so it only fires when fully connected
     threading.Thread(target=send_startup_message, daemon=True).start()
