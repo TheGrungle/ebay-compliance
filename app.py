@@ -203,14 +203,15 @@ def send_startup_message():
         f"• **{s['name']}** — max ${s['max_price']} | every {s.get('poll_interval', 30)}s"
         for s in searches
     ) or "No searches configured."
+    pid = os.getpid()
     _discord({
         "embeds": [{
             "title": "🟢 RAM Scanner is live",
-            "description": f"**Active searches:**\n{lines}",
+            "description": f"**PID: `{pid}`**\n\n**Active searches:**\n{lines}",
             "color": 0x00FF00,
         }]
     })
-    _log("🟢 Scanner started.")
+    _log(f"🟢 Scanner started (PID {pid}).")
 
 def send_alert(title, price, url, search, item):
     age = get_listing_age(item)
