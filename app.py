@@ -55,14 +55,14 @@ stats = {
 # --- Searches config ---
 _searches_lock = threading.Lock()
 
-def load_searches() -> list:
+def load_searches():
     try:
         with open(SEARCHES_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
 
-def save_searches(searches: list):
+def save_searches(searches):
     with open(SEARCHES_FILE, "w") as f:
         json.dump(searches, f, indent=2)
 
@@ -74,17 +74,17 @@ def _load_seen():
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
-def _save_seen(seen: set):
+def _save_seen(seen):
     items = list(seen)
     if len(items) > MAX_SEEN:
         items = items[-MAX_SEEN:]
     with open(SEEN_FILE, "w") as f:
         json.dump(items, f)
 
-SEEN_LISTINGS: set = _load_seen()
+SEEN_LISTINGS = _load_seen()
 
 # --- eBay auth ---
-def get_access_token() -> str:
+def get_access_token():
     creds = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
     r = requests.post(
         "https://api.ebay.com/identity/v1/oauth2/token",
@@ -99,7 +99,7 @@ def get_access_token() -> str:
     return r.json()["access_token"]
 
 # --- Discord webhook ---
-def _discord(payload: dict, retries: int = 3):
+def _discord(payload, retries=3):
     for attempt in range(retries):
         try:
             r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
@@ -113,9 +113,9 @@ def _discord(payload: dict, retries: int = 3):
             time.sleep(2 ** attempt)
 
 # --- Bot log channel ---
-_bot_loop: asyncio.AbstractEventLoop | None = None
+_bot_loop = None
 
-def _log(message: str):
+def _log(message):
     print(message)
     if _bot_loop is None:
         return
@@ -128,7 +128,7 @@ def _log(message: str):
             print(f"Log send error: {e}")
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
 
-# --- Alerts ---
+# --- Alerts & status ---
 def send_startup_message():
     searches = load_searches()
     lines = "\n".join(f"• **{s['name']}** — max ${s['max_price']}" for s in searches) or "No searches configured."
@@ -141,7 +141,7 @@ def send_startup_message():
     })
     _log("🟢 Scanner started.")
 
-def send_alert(title: str, price: float, url: str, search: dict):
+def send_alert(title, price, url, search):
     _discord({
         "embeds": [{
             "title": title,
@@ -157,7 +157,7 @@ def send_alert(title: str, price: float, url: str, search: dict):
     stats["alerts_sent"] += 1
     _log(f"🔔 Alert: [{search['name']}] {title} — ${price:.2f}")
 
-def build_status_embed() -> dict:
+def build_status_embed():
     uptime = int(time.time() - stats["started_at"])
     hours, rem = divmod(uptime, 3600)
     minutes = rem // 60
@@ -177,7 +177,7 @@ def build_status_embed() -> dict:
     }
 
 # --- Scanner ---
-def _matches(title: str, search: dict) -> bool:
+def _matches(title, search):
     t = title.lower()
     if any(x in t for x in EXCLUSIONS):
         return False
@@ -268,7 +268,6 @@ def scan():
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
-
 search_group = app_commands.Group(name="search", description="Manage eBay searches")
 
 @search_group.command(name="list", description="List all active searches")
@@ -290,7 +289,7 @@ async def search_list(interaction: discord.Interaction):
     max_price="Maximum price",
     must_contain="Comma-separated title keywords (any match required, optional)",
     label="Alert label text (optional)",
-    color="Embed color as hex integer (optional, default 49151)",
+    color="Embed color as decimal integer (optional, default 49151)",
 )
 async def search_add(
     interaction: discord.Interaction,
@@ -360,7 +359,6 @@ async def search_edit(
         if not match:
             await interaction.response.send_message(f"No search named **{name}** found.", ephemeral=True)
             return
-
         if new_name:
             match["name"] = new_name
         if query:
@@ -373,7 +371,6 @@ async def search_edit(
             match["label"] = label
         if color >= 0:
             match["color"] = color
-
         save_searches(searches)
 
     display = new_name or name
@@ -400,12 +397,17 @@ async def on_ready():
     guild = discord.Object(id=DISCORD_GUILD_ID)
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)
-    print(f"Bot logged in as {bot.user} — commands synced to guild")
+    print(f"Bot logged in as {bot.user}")
+    # Send startup message here so it only fires when fully connected
+    threading.Thread(target=send_startup_message, daemon=True).start()
 
 def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot.start(DISCORD_BOT_TOKEN))
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(bot.start(DISCORD_BOT_TOKEN))
+    except Exception as e:
+        print(f"Bot error: {e}")
 
 # --- eBay compliance endpoint ---
 @app.route("/ebay-deletion", methods=["GET", "POST"])
@@ -419,10 +421,9 @@ def deletion():
         return jsonify({"challengeResponse": m.hexdigest()}), 200
     return "", 200
 
-# --- Startup ---
+# --- Startup (no blocking calls here) ---
 threading.Thread(target=run_bot, daemon=True).start()
 threading.Thread(target=scan, daemon=True).start()
-send_startup_message()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
