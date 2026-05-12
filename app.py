@@ -65,6 +65,9 @@ stats = {
 # --- Debug mode ---
 debug_mode = False
 
+# --- Pause flag ---
+paused = False
+
 # --- eBay API call tracking ---
 api_calls = {
     "total": 0,
@@ -269,10 +272,14 @@ def build_status_embed():
     last_scan_secs = int(time.time() - stats["last_scan_at"]) if stats["last_scan_at"] else None
     last_scan_str = f"{last_scan_secs}s ago" if last_scan_secs is not None else "never"
 
+    title = "📊 Scanner Status"
+    if paused:
+        title = "⏸️ Scanner Status (PAUSED)"
+
     return {
         "embeds": [{
-            "title": "📊 Scanner Status",
-            "color": 0xFF4500 if (projected or 0) > EBAY_DAILY_LIMIT else 0x5865F2,
+            "title": title,
+            "color": 0xFF4500 if (projected or 0) > EBAY_DAILY_LIMIT else (0x808080 if paused else 0x5865F2),
             "fields": [
                 {"name": "Uptime",            "value": f"{hours}h {minutes}m",         "inline": True},
                 {"name": "Last Scan",         "value": last_scan_str,                   "inline": True},
@@ -315,6 +322,10 @@ def scan():
     last_polled = {}  # search name -> last poll timestamp
 
     while True:
+        if paused:
+            time.sleep(SCAN_INTERVAL)
+            continue
+
         if time.time() - token_time > TOKEN_TTL:
             try:
                 token = get_access_token()
@@ -560,6 +571,14 @@ async def debug_command(interaction: discord.Interaction):
     state = "🟡 ON" if debug_mode else "⚫ OFF"
     _log(f"🐛 Debug mode toggled {state} by {interaction.user}")
     await interaction.response.send_message(f"Debug mode is now **{state}**. Every scanned item will be logged.", ephemeral=True)
+
+@tree.command(name="pause", description="Toggle the scanner on/off (no API calls while paused)")
+async def pause_command(interaction: discord.Interaction):
+    global paused
+    paused = not paused
+    state = "⏸️ PAUSED" if paused else "▶️ RUNNING"
+    _log(f"{state} by {interaction.user}")
+    await interaction.response.send_message(f"Scanner is now **{state}**.", ephemeral=True)
 
 tree.add_command(search_group)
 
