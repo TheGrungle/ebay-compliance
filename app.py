@@ -15,8 +15,6 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- Constants ---
-VERIFICATION_TOKEN = "qawfjoewjfoiewfsadfjjwqoifjewoifjoiwjfluhojflanfmdnugjwoiqjfnewfow"
-ENDPOINT = "https://ebay-compliance-5902.onrender.com/ebay-deletion"
 SEEN_FILE = "seen_listings.json"
 SEARCHES_FILE = "searches.json"
 MAX_SEEN = 5000
@@ -24,6 +22,7 @@ SCAN_INTERVAL = 30
 TOKEN_TTL = 5400
 STATUS_INTERVAL = 3600
 EBAY_DAILY_LIMIT = 5000
+NO_PRICE = float("inf")  # used when eBay returns no price (always fails max_price check)
 
 EXCLUSIONS = [
     "ecc", "server", "apple", "mac", "macbook", "rdimm", "lrdimm",
@@ -46,11 +45,20 @@ DISCORD_CHANNEL_ID     = int(_require("DISCORD_CHANNEL_ID"))
 DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
 DISCORD_GUILD_ID       = int(_require("DISCORD_GUILD_ID"))
 
+# Sensitive — env vars with backwards-compat fallbacks. Add these to Render to remove from source.
+VERIFICATION_TOKEN = os.environ.get(
+    "EBAY_VERIFICATION_TOKEN",
+    "qawfjoewjfoiewfsadfjjwqoifjewoifjoiwjfluhojflanfmdnugjwoiqjfnewfow",
+)
+ENDPOINT = os.environ.get(
+    "EBAY_DELETION_ENDPOINT",
+    "https://ebay-compliance-5902.onrender.com/ebay-deletion",
+)
+
 # --- Stats ---
 stats = {
-    "scans": 0,
-    "items_found": 0,
     "alerts_sent": 0,
+    "last_scan_at": 0,
     "started_at": time.time(),
 }
 
@@ -114,20 +122,26 @@ def save_searches(searches):
     with open(SEARCHES_FILE, "w") as f:
         json.dump(searches, f, indent=2)
 
-# --- Seen listings ---
+# --- Seen listings (ordered: dict in Python 3.7+ preserves insertion order, O(1) lookups) ---
 def _load_seen():
     try:
         with open(SEEN_FILE) as f:
-            return set(json.load(f))
+            data = json.load(f)
+            return {item_id: True for item_id in data}
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return {}
 
 def _save_seen(seen):
-    items = list(seen)
-    if len(items) > MAX_SEEN:
-        items = items[-MAX_SEEN:]
+    items = list(seen.keys())
     with open(SEEN_FILE, "w") as f:
         json.dump(items, f)
+
+def _add_seen(item_id):
+    SEEN_LISTINGS[item_id] = True
+    while len(SEEN_LISTINGS) > MAX_SEEN:
+        # Remove oldest entry (first inserted)
+        oldest = next(iter(SEEN_LISTINGS))
+        del SEEN_LISTINGS[oldest]
 
 SEEN_LISTINGS = _load_seen()
 
@@ -213,7 +227,7 @@ def send_startup_message():
     pid = os.getpid()
     _discord({
         "embeds": [{
-            "title": "🟢 RAM Scanner is live",
+            "title": "🟢 eBay Scanner is live",
             "description": f"**PID: `{pid}`**\n\n**Active searches:**\n{lines}",
             "color": 0x00FF00,
         }]
@@ -222,10 +236,11 @@ def send_startup_message():
 
 def send_alert(title, price, url, search, item):
     age = get_listing_age(item)
+    item_id = item.get("itemId", "?")
     fields = [
-        {"name": "Price",     "value": f"${price:.2f}",            "inline": True},
-        {"name": "Deal Tier", "value": search.get("label", "Deal"), "inline": True},
-        {"name": "Search",    "value": search["name"],              "inline": True},
+        {"name": "Price",   "value": f"${price:.2f}",                         "inline": True},
+        {"name": "Search",  "value": search.get("label") or search["name"],   "inline": True},
+        {"name": "Item ID", "value": f"`{item_id}`",                          "inline": True},
     ]
     if age:
         fields.append({"name": "Listed", "value": age, "inline": True})
@@ -251,13 +266,16 @@ def build_status_embed():
     proj_str = f"{projected:,}" if projected is not None else "calculating..."
     warn = " ⚠️" if (projected or 0) > EBAY_DAILY_LIMIT else ""
 
+    last_scan_secs = int(time.time() - stats["last_scan_at"]) if stats["last_scan_at"] else None
+    last_scan_str = f"{last_scan_secs}s ago" if last_scan_secs is not None else "never"
+
     return {
         "embeds": [{
             "title": "📊 Scanner Status",
             "color": 0xFF4500 if (projected or 0) > EBAY_DAILY_LIMIT else 0x5865F2,
             "fields": [
                 {"name": "Uptime",            "value": f"{hours}h {minutes}m",         "inline": True},
-                {"name": "Scans Run",         "value": str(stats["scans"]),             "inline": True},
+                {"name": "Last Scan",         "value": last_scan_str,                   "inline": True},
                 {"name": "Alerts Sent",       "value": str(stats["alerts_sent"]),       "inline": True},
                 {"name": "API Calls Today",   "value": f"{calls_today:,} / {EBAY_DAILY_LIMIT:,} ({pct})", "inline": True},
                 {"name": f"Projected 24h{warn}", "value": proj_str,                    "inline": True},
@@ -313,7 +331,6 @@ def scan():
         with _searches_lock:
             searches = load_searches()
 
-        stats["scans"] += 1
         dirty = False
         new_this_cycle = 0
         now = time.time()
@@ -337,6 +354,9 @@ def scan():
                 if search.get("category_id"):
                     params["category_ids"] = search["category_id"]
 
+                # Count the call BEFORE we know if it succeeded — failed calls still cost quota
+                record_api_call()
+                stats["last_scan_at"] = time.time()
                 r = requests.get(
                     "https://api.ebay.com/buy/browse/v1/item_summary/search",
                     headers={"Authorization": f"Bearer {token}"},
@@ -344,12 +364,12 @@ def scan():
                     timeout=15,
                 )
                 r.raise_for_status()
-                record_api_call()
 
                 for item in r.json().get("itemSummaries", []):
                     item_id = item.get("itemId")
                     title = item.get("title", "")
-                    price = float(item.get("price", {}).get("value", 999))
+                    price_val = item.get("price", {}).get("value")
+                    price = float(price_val) if price_val is not None else NO_PRICE
 
                     if debug_mode:
                         seen = item_id in SEEN_LISTINGS
@@ -363,8 +383,7 @@ def scan():
                     if item_id in SEEN_LISTINGS:
                         continue
 
-                    SEEN_LISTINGS.add(item_id)
-                    stats["items_found"] += 1
+                    _add_seen(item_id)
                     new_this_cycle += 1
                     dirty = True
 
@@ -384,7 +403,7 @@ def scan():
                 _log(f"❌ Scan error [{search['name']}]: {e}")
 
         if new_this_cycle:
-            _log(f"🔍 Scan #{stats['scans']}: {new_this_cycle} new item(s) across {len(searches)} search(es).")
+            _log(f"🔍 {new_this_cycle} new item(s) across {len(searches)} search(es).")
 
         if dirty:
             _save_seen(SEEN_LISTINGS)
@@ -525,7 +544,7 @@ async def search_edit(
     _log(f"✏️ Search edited: {name} → {display}")
     await interaction.response.send_message(f"✅ Search **{display}** updated.", ephemeral=True)
 
-@tree.command(name="status", description="Get current RAM scanner stats")
+@tree.command(name="status", description="Get current scanner stats")
 async def status_command(interaction: discord.Interaction):
     _discord(build_status_embed())
     await interaction.response.send_message("Status posted!", ephemeral=True)
