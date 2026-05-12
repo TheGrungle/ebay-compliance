@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -22,6 +23,7 @@ MAX_SEEN = 5000
 SCAN_INTERVAL = 30
 TOKEN_TTL = 5400
 STATUS_INTERVAL = 3600
+EBAY_DAILY_LIMIT = 5000
 
 EXCLUSIONS = [
     "ecc", "server", "apple", "mac", "macbook", "rdimm", "lrdimm",
@@ -51,6 +53,52 @@ stats = {
     "alerts_sent": 0,
     "started_at": time.time(),
 }
+
+# --- Debug mode ---
+debug_mode = False
+
+# --- eBay API call tracking ---
+api_calls = {
+    "total": 0,
+    "timestamps": [],   # rolling window of call times for rate calculation
+    "day_start": time.time(),
+    "calls_today": 0,
+}
+_api_lock = threading.Lock()
+
+def record_api_call():
+    now = time.time()
+    with _api_lock:
+        api_calls["total"] += 1
+        api_calls["calls_today"] += 1
+        api_calls["timestamps"].append(now)
+        # Reset daily counter at midnight (86400s)
+        if now - api_calls["day_start"] >= 86400:
+            api_calls["calls_today"] = 1
+            api_calls["day_start"] = now
+        # Keep only last 2 hours of timestamps for rate calc
+        cutoff = now - 7200
+        api_calls["timestamps"] = [t for t in api_calls["timestamps"] if t > cutoff]
+
+def get_api_projection():
+    with _api_lock:
+        calls_today = api_calls["calls_today"]
+        timestamps = list(api_calls["timestamps"])
+        day_start = api_calls["day_start"]
+
+    elapsed = time.time() - day_start
+    if elapsed < 60 or len(timestamps) < 2:
+        return calls_today, None
+
+    # Rate based on rolling window
+    window = timestamps[-1] - timestamps[0]
+    if window <= 0:
+        return calls_today, None
+
+    rate_per_sec = len(timestamps) / window
+    remaining_secs = 86400 - elapsed
+    projected = int(calls_today + rate_per_sec * remaining_secs)
+    return calls_today, projected
 
 # --- Searches config ---
 _searches_lock = threading.Lock()
@@ -128,50 +176,83 @@ def _log(message):
             print(f"Log send error: {e}")
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
 
+# --- Listing age ---
+def get_listing_age(item):
+    raw = item.get("itemCreationDate")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        age_secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if age_secs < 60:
+            return f"{age_secs}s old"
+        elif age_secs < 3600:
+            return f"{age_secs // 60}m old"
+        else:
+            h = age_secs // 3600
+            m = (age_secs % 3600) // 60
+            return f"{h}h {m}m old"
+    except Exception:
+        return None
+
 # --- Alerts & status ---
 def send_startup_message():
     searches = load_searches()
-    lines = "\n".join(f"• **{s['name']}** — max ${s['max_price']}" for s in searches) or "No searches configured."
+    lines = "\n".join(
+        f"• **{s['name']}** — max ${s['max_price']} | every {s.get('poll_interval', 30)}s"
+        for s in searches
+    ) or "No searches configured."
     _discord({
         "embeds": [{
             "title": "🟢 RAM Scanner is live",
-            "description": f"Scanning every 30 seconds.\n\n**Active searches:**\n{lines}",
+            "description": f"**Active searches:**\n{lines}",
             "color": 0x00FF00,
         }]
     })
     _log("🟢 Scanner started.")
 
-def send_alert(title, price, url, search):
+def send_alert(title, price, url, search, item):
+    age = get_listing_age(item)
+    fields = [
+        {"name": "Price",     "value": f"${price:.2f}",            "inline": True},
+        {"name": "Deal Tier", "value": search.get("label", "Deal"), "inline": True},
+        {"name": "Search",    "value": search["name"],              "inline": True},
+    ]
+    if age:
+        fields.append({"name": "Listed", "value": age, "inline": True})
+
     _discord({
         "embeds": [{
             "title": title,
             "url": url,
             "color": search.get("color", 0x00BFFF),
-            "fields": [
-                {"name": "Price",     "value": f"${price:.2f}",            "inline": True},
-                {"name": "Deal Tier", "value": search.get("label", "Deal"), "inline": True},
-                {"name": "Search",    "value": search["name"],              "inline": True},
-            ],
+            "fields": fields,
         }]
     })
     stats["alerts_sent"] += 1
-    _log(f"🔔 Alert: [{search['name']}] {title} — ${price:.2f}")
+    _log(f"🔔 Alert: [{search['name']}] {title} — ${price:.2f}" + (f" ({age})" if age else ""))
 
 def build_status_embed():
     uptime = int(time.time() - stats["started_at"])
     hours, rem = divmod(uptime, 3600)
     minutes = rem // 60
     searches = load_searches()
+    calls_today, projected = get_api_projection()
+    pct = f"{calls_today / EBAY_DAILY_LIMIT * 100:.1f}%"
+    proj_str = f"{projected:,}" if projected is not None else "calculating..."
+    warn = " ⚠️" if (projected or 0) > EBAY_DAILY_LIMIT else ""
+
     return {
         "embeds": [{
             "title": "📊 Scanner Status",
-            "color": 0x5865F2,
+            "color": 0xFF4500 if (projected or 0) > EBAY_DAILY_LIMIT else 0x5865F2,
             "fields": [
-                {"name": "Uptime",          "value": f"{hours}h {minutes}m",    "inline": True},
-                {"name": "Scans Run",       "value": str(stats["scans"]),        "inline": True},
-                {"name": "Items Found",     "value": str(stats["items_found"]),  "inline": True},
-                {"name": "Alerts Sent",     "value": str(stats["alerts_sent"]),  "inline": True},
-                {"name": "Active Searches", "value": str(len(searches)),         "inline": True},
+                {"name": "Uptime",            "value": f"{hours}h {minutes}m",         "inline": True},
+                {"name": "Scans Run",         "value": str(stats["scans"]),             "inline": True},
+                {"name": "Alerts Sent",       "value": str(stats["alerts_sent"]),       "inline": True},
+                {"name": "API Calls Today",   "value": f"{calls_today:,} / {EBAY_DAILY_LIMIT:,} ({pct})", "inline": True},
+                {"name": f"Projected 24h{warn}", "value": proj_str,                    "inline": True},
+                {"name": "Active Searches",   "value": str(len(searches)),              "inline": True},
             ],
         }]
     }
@@ -198,6 +279,7 @@ def scan():
 
     token_time = time.time()
     last_status = time.time()
+    last_polled = {}  # search name -> last poll timestamp
 
     while True:
         if time.time() - token_time > TOKEN_TTL:
@@ -219,8 +301,16 @@ def scan():
         stats["scans"] += 1
         dirty = False
         new_this_cycle = 0
+        now = time.time()
 
         for search in searches:
+            poll_interval = search.get("poll_interval", SCAN_INTERVAL)
+            last = last_polled.get(search["name"], 0)
+            if now - last < poll_interval:
+                continue  # not time yet for this search
+
+            last_polled[search["name"]] = now
+
             try:
                 r = requests.get(
                     "https://api.ebay.com/buy/browse/v1/item_summary/search",
@@ -231,13 +321,27 @@ def scan():
                         "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
                         "sort": "newlyListed",
                         "limit": "50",
+                        "fieldgroups": "EXTENDED",
                     },
                     timeout=15,
                 )
                 r.raise_for_status()
+                record_api_call()
 
                 for item in r.json().get("itemSummaries", []):
                     item_id = item.get("itemId")
+                    title = item.get("title", "")
+                    price = float(item.get("price", {}).get("value", 999))
+
+                    if debug_mode:
+                        seen = item_id in SEEN_LISTINGS
+                        matches = _matches(title, search)
+                        _log(
+                            f"[DEBUG][{search['name']}] {'SEEN' if seen else 'NEW'} | "
+                            f"{'MATCH' if matches else 'NO MATCH'} | "
+                            f"${price:.2f} | {title[:60]}"
+                        )
+
                     if item_id in SEEN_LISTINGS:
                         continue
 
@@ -246,12 +350,10 @@ def scan():
                     new_this_cycle += 1
                     dirty = True
 
-                    title = item.get("title", "")
-                    price = float(item.get("price", {}).get("value", 999))
-                    url   = item.get("itemWebUrl", "")
+                    url = item.get("itemWebUrl", "")
 
                     if _matches(title, search):
-                        send_alert(title, price, url, search)
+                        send_alert(title, price, url, search, item)
 
             except Exception as e:
                 _log(f"❌ Scan error [{search['name']}]: {e}")
@@ -279,7 +381,8 @@ async def search_list(interaction: discord.Interaction):
     lines = []
     for i, s in enumerate(searches):
         must = ", ".join(s.get("must_contain", [])) or "any"
-        lines.append(f"**{i+1}. {s['name']}**\nQuery: `{s['query']}`\nMax: ${s['max_price']} | Keywords: {must}\n")
+        interval = s.get("poll_interval", 30)
+        lines.append(f"**{i+1}. {s['name']}**\nQuery: `{s['query']}`\nMax: ${s['max_price']} | Poll: every {interval}s | Keywords: {must}\n")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 @search_group.command(name="add", description="Add a new search")
@@ -290,6 +393,7 @@ async def search_list(interaction: discord.Interaction):
     must_contain="Comma-separated title keywords (any match required, optional)",
     label="Alert label text (optional)",
     color="Embed color as decimal integer (optional, default 49151)",
+    poll_interval="How often to poll in seconds, multiples of 30 (optional, default 30)",
 )
 async def search_add(
     interaction: discord.Interaction,
@@ -299,7 +403,9 @@ async def search_add(
     must_contain: str = "",
     label: str = "",
     color: int = 49151,
+    poll_interval: int = 30,
 ):
+    poll_interval = max(30, (poll_interval // 30) * 30)
     with _searches_lock:
         searches = load_searches()
         if any(s["name"].lower() == name.lower() for s in searches):
@@ -310,13 +416,14 @@ async def search_add(
             "query": query,
             "category_id": "170083",
             "max_price": max_price,
+            "poll_interval": poll_interval,
             "must_contain": [k.strip() for k in must_contain.split(",") if k.strip()],
             "label": label or name,
             "color": color,
         })
         save_searches(searches)
 
-    _log(f"➕ Search added: {name} (max ${max_price})")
+    _log(f"➕ Search added: {name} (max ${max_price}, every {poll_interval}s)")
     await interaction.response.send_message(f"✅ Search **{name}** added.", ephemeral=True)
 
 @search_group.command(name="remove", description="Remove a search by name")
@@ -342,6 +449,7 @@ async def search_remove(interaction: discord.Interaction, name: str):
     must_contain="New comma-separated keywords (optional)",
     label="New alert label text (optional)",
     color="New embed color as decimal integer (optional)",
+    poll_interval="New poll interval in seconds, multiples of 30 (optional)",
 )
 async def search_edit(
     interaction: discord.Interaction,
@@ -352,6 +460,7 @@ async def search_edit(
     must_contain: str = "",
     label: str = "",
     color: int = None,
+    poll_interval: int = None,
 ):
     with _searches_lock:
         searches = load_searches()
@@ -371,6 +480,8 @@ async def search_edit(
             match["label"] = label
         if color is not None:
             match["color"] = color
+        if poll_interval is not None:
+            match["poll_interval"] = max(30, (poll_interval // 30) * 30)
         save_searches(searches)
 
     display = new_name or name
@@ -386,6 +497,14 @@ async def status_command(interaction: discord.Interaction):
 async def echo_command(interaction: discord.Interaction):
     await interaction.response.send_message("echo")
 
+@tree.command(name="debug", description="Toggle debug logging of all scanned items to the logs channel")
+async def debug_command(interaction: discord.Interaction):
+    global debug_mode
+    debug_mode = not debug_mode
+    state = "🟡 ON" if debug_mode else "⚫ OFF"
+    _log(f"🐛 Debug mode toggled {state} by {interaction.user}")
+    await interaction.response.send_message(f"Debug mode is now **{state}**. Every scanned item will be logged.", ephemeral=True)
+
 tree.add_command(search_group)
 
 @bot.event
@@ -398,7 +517,6 @@ async def on_ready():
     tree.clear_commands(guild=None)
     await tree.sync()
     print(f"Bot logged in as {bot.user}")
-    # Send startup message here so it only fires when fully connected
     threading.Thread(target=send_startup_message, daemon=True).start()
 
 def run_bot():

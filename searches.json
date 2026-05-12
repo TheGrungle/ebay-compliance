@@ -4,6 +4,7 @@
     "query": "DDR4 RAM 2x16 OR 32gb kit",
     "category_id": "170083",
     "max_price": 70,
+    "poll_interval": 30,
     "must_contain": ["2x16", "2 x 16", "32gb kit", "32 gb kit", "dual 16", "16gbx2", "16gb x2"],
     "label": "⚡ 2x16 DDR4",
     "color": 49151
@@ -13,6 +14,7 @@
     "query": "DDR4 RAM 2x32 OR 64gb kit",
     "category_id": "170083",
     "max_price": 150,
+    "poll_interval": 30,
     "must_contain": ["2x32", "2 x 32", "64gb kit", "64 gb kit", "dual 32", "32gbx2", "32gb x2"],
     "label": "🔥 2x32 DDR4",
     "color": 16721920
