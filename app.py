@@ -641,6 +641,32 @@ async def status_command(interaction: discord.Interaction):
 async def echo_command(interaction: discord.Interaction):
     await interaction.response.send_message("echo")
 
+@tree.command(name="test", description="Send a test ping and sample fake alerts to verify Discord delivery")
+async def test_command(interaction: discord.Interaction):
+    _discord({"content": "🧪 Test ping — if you can see this, the webhook works."})
+
+    samples = [
+        ("Crucial 32GB (2x16GB) DDR4-3200 Desktop RAM UDIMM", 59.99, "⚡ 2x16 DDR4", 49151),
+        ("G.Skill Ripjaws V 64GB (2x32GB) DDR4-3600 Desktop Memory", 139.99, "🔥 2x32 DDR4", 16721920),
+    ]
+    for title, price, label, color in samples:
+        _discord({
+            "embeds": [{
+                "title": f"[TEST] {title}",
+                "url": "https://www.ebay.com/",
+                "color": color,
+                "fields": [
+                    {"name": "Price",   "value": f"${price:.2f}", "inline": True},
+                    {"name": "Search",  "value": label,           "inline": True},
+                    {"name": "Item ID", "value": "`TEST-0000`",   "inline": True},
+                    {"name": "Listed",  "value": "2m old",        "inline": True},
+                ],
+            }]
+        })
+
+    _log(f"🧪 Test ping + sample alerts sent by {interaction.user}")
+    await interaction.response.send_message("✅ Sent a test ping and 2 sample alerts to the main channel.", ephemeral=True)
+
 @tree.command(name="debug", description="Toggle debug logging of all scanned items to the logs channel")
 async def debug_command(interaction: discord.Interaction):
     global debug_mode

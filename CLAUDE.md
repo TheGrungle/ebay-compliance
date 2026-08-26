@@ -92,6 +92,7 @@ per-search calls, always-on polling) both eliminated by this redesign.
 |---|---|
 | `/status` | Posts scanner stats embed to main channel (shows RUNNING / PAUSED / SLEEPING) |
 | `/echo` | Responds with "echo" — used to verify bot is alive |
+| `/test` | Sends a plain test ping plus 2 sample fake alerts (one 2x16, one 2x32, clearly marked `[TEST]`) to the main channel to verify webhook delivery and embed formatting |
 | `/debug` | Toggles verbose scan logging to logs channel |
 | `/pause` | Manually toggles the scanner on/off, independent of the awake-hours schedule |
 | `/broadcast show` | Shows the current broadcast query/category/poll interval |
