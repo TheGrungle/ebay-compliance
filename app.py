@@ -383,8 +383,12 @@ def _fetch_broadcast(token, broadcast, filters):
         return [], e
 
 def _process_results(items, filters, broadcast):
-    """Dedupe against the global seen set, then run every filter against each new item in code."""
+    """Dedupe against the global seen set, then run every filter against each new item in code.
+       Returns (new_count, excluded_count, matched_count) so the cycle log can show a real breakdown
+       instead of just "N new items" (which includes excluded/non-matching noise)."""
     new_count = 0
+    excluded_count = 0
+    matched_count = 0
     is_ram_category = broadcast.get("category_id") == "170083"
 
     for item in items:
@@ -403,6 +407,7 @@ def _process_results(items, filters, broadcast):
         new_count += 1
 
         if is_ram_category and any(x in t for x in EXCLUSIONS):
+            excluded_count += 1
             if debug_mode:
                 _log(f"[DEBUG] EXCLUDED | ${price:.2f} | {title[:60]}")
             continue
@@ -422,10 +427,12 @@ def _process_results(items, filters, broadcast):
                 matched_any = True
                 send_alert(title, price, url, filt, item)
 
+        if matched_any:
+            matched_count += 1
         if debug_mode:
             _log(f"[DEBUG] {'MATCH' if matched_any else 'NO MATCH'} | ${price:.2f} | {title[:60]}")
 
-    return new_count
+    return new_count, excluded_count, matched_count
 
 def scan():
     token = None
@@ -477,9 +484,12 @@ def scan():
         if err:
             _log(f"❌ Scan error: {err}")
         else:
-            count = _process_results(items, filters, broadcast)
-            if count:
-                _log(f"🔍 {count} new item(s).")
+            new_count, excluded_count, matched_count = _process_results(items, filters, broadcast)
+            if new_count:
+                _log(
+                    f"🔍 {new_count} new item(s) — {excluded_count} excluded, "
+                    f"{matched_count} matched a filter (alert sent)"
+                )
                 _save_seen(SEEN_LISTINGS)
 
         poll_interval = broadcast.get("poll_interval", DEFAULT_POLL_INTERVAL)
