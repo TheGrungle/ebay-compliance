@@ -923,8 +923,21 @@ def api_status():
         for e in log[:5]
     ]
 
+    now_utc = datetime.now(timezone.utc)
     with _recent_alerts_lock:
-        recent_alerts = list(reversed(RECENT_ALERTS[-10:]))  # newest first
+        recent_alerts = []
+        for e in reversed(RECENT_ALERTS[-10:]):  # newest first
+            try:
+                alerted_dt = datetime.fromisoformat(e["alerted_at"])
+                secs_ago = int((now_utc - alerted_dt).total_seconds())
+            except Exception:
+                secs_ago = None
+            recent_alerts.append({
+                "title": e["title"],
+                "price": e["price"],
+                "filter": e["filter"],
+                "alerted_secs_ago": secs_ago,
+            })
 
     return jsonify({
         "recent_alerts": recent_alerts,
