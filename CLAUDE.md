@@ -47,12 +47,15 @@ per-search calls, always-on polling) both eliminated by this redesign.
 | `DISCORD_LOG_CHANNEL_ID` | Logs channel ID (1503493724611547277) |
 | `DISCORD_GUILD_ID` | Server ID (1445992804760293499) |
 | `SCANNER_TZ` | **IANA timezone for the awake-hours schedule (e.g. `America/New_York`, `America/Chicago`). Optional — defaults to `America/Chicago` if unset.** |
+| `TEST_DISCORD_WEBHOOK` | Optional. Webhook URL for a second "test channel" that gets every scanned RAM listing — unfiltered, including excluded/non-matching ones — with exact listed time and seconds-since-listed. Unset = feature disabled. |
 | `PYTHON_VERSION` | Must be `3.12.0` |
 
 ## Key Files
 - `app.py` — entire application
 - `searches.json` — broadcast query + filters, read every cycle (no redeploy needed to change)
 - `seen_listings.json` — persisted set of already-alerted item IDs (ephemeral on Render — wiped on redeploy)
+- `market_tracking.json` — item IDs currently active in the broadcast results, for sold/ended detection (ephemeral)
+- `market_sold_log.json` — completed entries (title, price, listed/gone timestamps, duration), capped at 1,000, backs the `/market-trends` page (ephemeral)
 - `requirements.txt` — flask, gunicorn==21.2.0, requests, discord.py, tzdata
 - `runtime.txt` — python-3.12.0 (Render may ignore this; use PYTHON_VERSION env var instead)
 - `Procfile` — gunicorn start command with explicit port and logging
@@ -119,6 +122,28 @@ poll interval, active filter count, and current state (RUNNING / PAUSED / SLEEPI
 - One broadcast call per poll cycle regardless of filter count — see "Awake-hours schedule" above for the budget math
 - `fieldgroups=EXTENDED` is passed to get `itemCreationDate` for listing age
 
+## Test Channel Feed (`TEST_DISCORD_WEBHOOK`)
+When set, every listing the scanner sees for the first time each cycle is posted to this second
+webhook — regardless of exclusions or filter matches — with:
+- Exact listed timestamp (from eBay's `itemCreationDate`, converted to `SCANNER_TZ`)
+- Exact seconds elapsed since listing when spotted
+- A status line: `🚫 Excluded`, `⏳ Too old`, `✅ Matched: <filter name(s)>`, or `— No filter match`
+
+This reuses the same single broadcast API call as everything else — zero extra API cost. Messages are
+batched in groups of 10 per Discord embed to stay under rate limits and embed field caps.
+
+## Market Trends Page (`/market-trends`)
+A read-only HTML page (no auth) showing every listing that dropped out of the active broadcast
+results — used as a proxy for "sold or ended" — with how long it was up before that happened
+("time to go"). Columns: title, price, matched filter, listed-at, gone-at, duration.
+
+**Important caveat:** the eBay Browse API only exposes *active* listings, not confirmed sales data
+(that requires eBay's Marketplace Insights API, which needs separate developer approval this app
+doesn't have). "Gone from active results" can also mean an auction expired unsold, the seller removed
+it, or it got relisted as a new item ID — not only a genuine sale. `BROADCAST_LIMIT` is set to 200 (the
+Browse API max, same 1 API call either way) specifically to minimize the case where an active item
+just falls off the page due to listing volume rather than actually ending.
+
 ## Global Exclusions (hardcoded)
 Applied only when `broadcast.category_id` is `170083` (Desktop Memory). Listings are skipped if their
 title contains: `ecc`, `server`, `apple`, `mac`, `macbook`, `rdimm`, `lrdimm`, `for parts`, `parts only`,
@@ -126,10 +151,12 @@ title contains: `ecc`, `server`, `apple`, `mac`, `macbook`, `rdimm`, `lrdimm`, `
 
 ## Known Limitations
 - `seen_listings.json` is wiped on every Render redeploy — causes a one-time flood of old listings on restart
+- `market_tracking.json` / `market_sold_log.json` are also wiped on redeploy — trend history resets
 - `searches.json` edits via Discord commands don't survive redeploys
-- Fix for both: use a persistent database (Redis or SQLite with Render disk)
+- Fix for all of the above: use a persistent database (Redis or SQLite with Render disk)
 - Render free tier may spin down after inactivity
 - `SCANNER_TZ` must be set correctly or the awake-hours schedule runs at the wrong clock hours for your location
+- "Sold" on the market trends page is really "disappeared from active results" — see the caveat in that section above
 
 ## Discord Server Info
 - Server ID: 1445992804760293499

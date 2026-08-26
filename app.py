@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+from html import escape as html_escape
 from zoneinfo import ZoneInfo
 
 import discord
@@ -18,7 +19,11 @@ app = Flask(__name__)
 # --- Constants ---
 SEARCHES_FILE = "searches.json"
 SEEN_FILE = "seen_listings.json"
+MARKET_TRACKING_FILE = "market_tracking.json"
+MARKET_SOLD_LOG_FILE = "market_sold_log.json"
 MAX_SEEN = 5000
+MAX_SOLD_LOG = 1000
+BROADCAST_LIMIT = 200  # max eBay Browse API allows per call; costs the same 1 API call regardless
 DEFAULT_POLL_INTERVAL = 15
 TOKEN_TTL = 5400
 STATUS_INTERVAL = 3600
@@ -49,6 +54,9 @@ def _require(name):
 EBAY_APP_ID            = _require("EBAY_APP_ID")
 EBAY_CERT_ID           = _require("EBAY_CERT_ID")
 DISCORD_WEBHOOK        = _require("DISCORD_WEBHOOK")
+# Optional second webhook for an unfiltered "test channel" feed — every scanned listing gets posted
+# there with exact timing info, regardless of exclusions/filters. Leave unset to disable.
+TEST_DISCORD_WEBHOOK   = os.environ.get("TEST_DISCORD_WEBHOOK", "")
 DISCORD_BOT_TOKEN      = _require("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID     = int(_require("DISCORD_CHANNEL_ID"))
 DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
@@ -179,6 +187,92 @@ def _add_seen(item_id):
 
 SEEN_LISTINGS = _load_seen()
 
+# --- Market trend tracking ---
+# MARKET_TRACKING: item_id -> {title, price, created_at, first_seen, matched_filters} for listings
+# currently active in the broadcast results. When a tracked item stops showing up in the active
+# results, it's assumed sold/ended and moved into SOLD_LOG with a computed duration.
+def _load_market_tracking():
+    try:
+        with open(MARKET_TRACKING_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_market_tracking(tracking):
+    with open(MARKET_TRACKING_FILE, "w") as f:
+        json.dump(tracking, f)
+
+def _load_sold_log():
+    try:
+        with open(MARKET_SOLD_LOG_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_sold_log(log):
+    with open(MARKET_SOLD_LOG_FILE, "w") as f:
+        json.dump(log, f)
+
+MARKET_TRACKING = _load_market_tracking()
+SOLD_LOG = _load_sold_log()
+_market_lock = threading.Lock()
+
+def _update_market_tracking(items, filters):
+    """Diff this cycle's active items against MARKET_TRACKING to detect listings that dropped out
+       of the active set (proxy for sold/ended), and record how long they were up."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    current_ids = set()
+    dirty = False
+
+    with _market_lock:
+        for item in items:
+            item_id = item.get("itemId")
+            if not item_id:
+                continue
+            current_ids.add(item_id)
+            if item_id in MARKET_TRACKING:
+                continue
+
+            title = item.get("title", "")
+            price_val = item.get("price", {}).get("value")
+            price = float(price_val) if price_val is not None else None
+            matched = [
+                f["name"] for f in filters
+                if price is not None and price <= f["max_price"] and _matches(title, f)
+            ]
+            MARKET_TRACKING[item_id] = {
+                "title": title,
+                "price": price,
+                "created_at": item.get("itemCreationDate") or now_iso,
+                "first_seen": now_iso,
+                "matched_filters": matched,
+            }
+            dirty = True
+
+        for item_id in [iid for iid in MARKET_TRACKING if iid not in current_ids]:
+            entry = MARKET_TRACKING.pop(item_id)
+            try:
+                created_dt = datetime.fromisoformat(entry["created_at"].replace("Z", "+00:00"))
+            except Exception:
+                created_dt = datetime.fromisoformat(entry["first_seen"])
+            gone_dt = datetime.now(timezone.utc)
+            duration_secs = max(0, int((gone_dt - created_dt).total_seconds()))
+            SOLD_LOG.append({
+                "title": entry["title"],
+                "price": entry["price"],
+                "matched_filters": entry["matched_filters"],
+                "created_at": entry["created_at"],
+                "gone_at": gone_dt.isoformat(),
+                "duration_secs": duration_secs,
+            })
+            dirty = True
+
+        del SOLD_LOG[:-MAX_SOLD_LOG]
+
+        if dirty:
+            _save_market_tracking(MARKET_TRACKING)
+            _save_sold_log(SOLD_LOG)
+
 # --- HTTP session (keep-alive saves ~200ms per call) ---
 _http = requests.Session()
 
@@ -198,10 +292,11 @@ def get_access_token():
     return r.json()["access_token"]
 
 # --- Discord webhook ---
-def _discord(payload, retries=3):
+def _discord(payload, retries=3, webhook_url=None):
+    url = webhook_url or DISCORD_WEBHOOK
     for attempt in range(retries):
         try:
-            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+            r = requests.post(url, json=payload, timeout=10)
             if r.status_code == 429:
                 time.sleep(r.json().get("retry_after", 1))
                 continue
@@ -363,7 +458,7 @@ def _fetch_broadcast(token, broadcast, filters):
         "q": broadcast.get("query", ""),
         "filter": f"price:[..{max_price}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
         "sort": "newlyListed",
-        "limit": "50",
+        "limit": str(BROADCAST_LIMIT),
         "fieldgroups": "EXTENDED",
     }
     if broadcast.get("category_id"):
@@ -384,11 +479,14 @@ def _fetch_broadcast(token, broadcast, filters):
 
 def _process_results(items, filters, broadcast):
     """Dedupe against the global seen set, then run every filter against each new item in code.
-       Returns (new_count, excluded_count, matched_count) so the cycle log can show a real breakdown
-       instead of just "N new items" (which includes excluded/non-matching noise)."""
+       Returns (new_count, excluded_count, matched_count, test_feed) so the cycle log can show a real
+       breakdown instead of just "N new items" (which includes excluded/non-matching noise), and the
+       unfiltered test-channel feed (empty list if TEST_DISCORD_WEBHOOK isn't configured)."""
     new_count = 0
     excluded_count = 0
     matched_count = 0
+    test_feed = []
+    collect_test_feed = bool(TEST_DISCORD_WEBHOOK)
     is_ram_category = broadcast.get("category_id") == "170083"
 
     for item in items:
@@ -406,33 +504,93 @@ def _process_results(items, filters, broadcast):
         _add_seen(item_id)
         new_count += 1
 
-        if is_ram_category and any(x in t for x in EXCLUSIONS):
+        excluded = is_ram_category and any(x in t for x in EXCLUSIONS)
+        if excluded:
             excluded_count += 1
-            if debug_mode:
-                _log(f"[DEBUG] EXCLUDED | ${price:.2f} | {title[:60]}")
-            continue
 
         age_secs = get_listing_age_seconds(item)
-        if age_secs is not None and age_secs > MAX_LISTING_AGE:
-            if debug_mode:
-                _log(f"[DEBUG] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
-            continue
+        too_old = age_secs is not None and age_secs > MAX_LISTING_AGE
+
+        matched_filters = []
+        if not excluded and not too_old:
+            for filt in filters:
+                if price <= filt["max_price"] and _matches(title, filt):
+                    matched_filters.append(filt)
 
         url = item.get("itemWebUrl", "")
-        matched_any = False
-        for filt in filters:
-            if price > filt["max_price"]:
-                continue
-            if _matches(title, filt):
-                matched_any = True
+        if matched_filters:
+            matched_count += 1
+            for filt in matched_filters:
                 send_alert(title, price, url, filt, item)
 
-        if matched_any:
-            matched_count += 1
         if debug_mode:
-            _log(f"[DEBUG] {'MATCH' if matched_any else 'NO MATCH'} | ${price:.2f} | {title[:60]}")
+            if excluded:
+                _log(f"[DEBUG] EXCLUDED | ${price:.2f} | {title[:60]}")
+            elif too_old:
+                _log(f"[DEBUG] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
+            else:
+                _log(f"[DEBUG] {'MATCH' if matched_filters else 'NO MATCH'} | ${price:.2f} | {title[:60]}")
 
-    return new_count, excluded_count, matched_count
+        if collect_test_feed:
+            if excluded:
+                status = "🚫 Excluded"
+            elif too_old:
+                status = f"⏳ Too old ({age_secs // 3600}h)"
+            elif matched_filters:
+                status = "✅ Matched: " + ", ".join(f["name"] for f in matched_filters)
+            else:
+                status = "— No filter match"
+            test_feed.append({
+                "title": title,
+                "price": price,
+                "url": url,
+                "age_secs": age_secs,
+                "created_raw": item.get("itemCreationDate"),
+                "status": status,
+            })
+
+    return new_count, excluded_count, matched_count, test_feed
+
+def send_test_feed(entries):
+    """Post every scanned listing (unfiltered) to the test channel with exact timing info."""
+    if not TEST_DISCORD_WEBHOOK or not entries:
+        return
+    fields = []
+    for e in entries:
+        listed_str = "unknown"
+        if e["created_raw"]:
+            try:
+                listed_dt = datetime.fromisoformat(e["created_raw"].replace("Z", "+00:00")).astimezone(SCANNER_TZ)
+                listed_str = listed_dt.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+            except Exception:
+                pass
+        age_str = f"{e['age_secs']}s ago" if e["age_secs"] is not None else "unknown"
+        price_str = f"${e['price']:.2f}" if e["price"] != NO_PRICE else "no price"
+        value = f"Listed: {listed_str}\nSpotted: {age_str}\nStatus: {e['status']}"
+        if e["url"]:
+            value += f"\n[View listing]({e['url']})"
+        fields.append({"name": f"{price_str} — {e['title'][:150]}", "value": value, "inline": False})
+
+    for i in range(0, len(fields), 10):
+        batch = fields[i:i + 10]
+        _discord(
+            {"embeds": [{"title": f"🧪 Unfiltered RAM feed — {len(batch)} listing(s)", "color": 0x99AAB5, "fields": batch}]},
+            webhook_url=TEST_DISCORD_WEBHOOK,
+        )
+
+def _format_duration(secs):
+    if secs is None:
+        return "unknown"
+    if secs < 60:
+        return f"{secs}s"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m {secs}s"
+    hours, mins = divmod(mins, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
 
 def scan():
     token = None
@@ -484,13 +642,15 @@ def scan():
         if err:
             _log(f"❌ Scan error: {err}")
         else:
-            new_count, excluded_count, matched_count = _process_results(items, filters, broadcast)
+            _update_market_tracking(items, filters)
+            new_count, excluded_count, matched_count, test_feed = _process_results(items, filters, broadcast)
             if new_count:
                 _log(
                     f"🔍 {new_count} new item(s) — {excluded_count} excluded, "
                     f"{matched_count} matched a filter (alert sent)"
                 )
                 _save_seen(SEEN_LISTINGS)
+            send_test_feed(test_feed)
 
         poll_interval = broadcast.get("poll_interval", DEFAULT_POLL_INTERVAL)
         elapsed = time.time() - cycle_start
@@ -733,6 +893,76 @@ def deletion():
         m.update(ENDPOINT.encode())
         return jsonify({"challengeResponse": m.hexdigest()}), 200
     return "", 200
+
+# --- Market trends page ---
+@app.route("/market-trends")
+def market_trends():
+    with _market_lock:
+        log = list(reversed(SOLD_LOG))  # newest gone first
+
+    durations = [e["duration_secs"] for e in log if e.get("duration_secs") is not None]
+    avg_secs = int(sum(durations) / len(durations)) if durations else None
+
+    config = load_config()
+    price_cap = max((f["max_price"] for f in config.get("filters", [])), default=None)
+
+    rows = []
+    for e in log:
+        price = e.get("price")
+        price_str = f"${price:.2f}" if price is not None else "?"
+        matched = html_escape(", ".join(e.get("matched_filters", [])) or "—")
+        try:
+            created_str = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")).astimezone(SCANNER_TZ).strftime("%Y-%m-%d %I:%M %p")
+        except Exception:
+            created_str = "?"
+        try:
+            gone_str = datetime.fromisoformat(e["gone_at"]).astimezone(SCANNER_TZ).strftime("%Y-%m-%d %I:%M %p")
+        except Exception:
+            gone_str = "?"
+        rows.append(
+            "<tr>"
+            f"<td>{html_escape(e.get('title', ''))}</td>"
+            f"<td>{price_str}</td>"
+            f"<td>{matched}</td>"
+            f"<td>{created_str}</td>"
+            f"<td>{gone_str}</td>"
+            f"<td>{_format_duration(e.get('duration_secs'))}</td>"
+            "</tr>"
+        )
+
+    table_rows = "\n".join(rows) or "<tr><td colspan=6>No data yet — check back after listings have cycled off eBay.</td></tr>"
+    cap_note = f"under the ${price_cap:.0f} price cap" if price_cap else "under the tracked price cap"
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RAM Market Trends</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #444; padding: 6px 10px; text-align: left; font-size: 14px; }}
+th {{ background: #222; }}
+tr:nth-child(even) {{ background: #1a1a1a; }}
+h1 {{ font-size: 1.4rem; }}
+.note {{ color: #999; font-size: 0.85rem; max-width: 700px; }}
+</style>
+</head>
+<body>
+<h1>RAM Market Trends</h1>
+<p class="note">
+Tracks every listing that disappeared from active eBay search results in the scanned category,
+{cap_note}. "Disappeared" is used as a proxy for sold/ended since the Browse API only exposes active
+listings, not confirmed sale data — this can occasionally include expired, removed, or relisted items,
+not just genuine sales. Data resets on every redeploy.
+</p>
+<p><b>{len(log)}</b> tracked so far. Average time to go: <b>{_format_duration(avg_secs)}</b></p>
+<table>
+<tr><th>Title</th><th>Price</th><th>Matched Filter</th><th>Listed At</th><th>Gone At</th><th>Time to Go</th></tr>
+{table_rows}
+</table>
+</body>
+</html>"""
 
 # --- Startup (no blocking calls here) ---
 threading.Thread(target=run_bot, daemon=True).start()
