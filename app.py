@@ -6,7 +6,6 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from html import escape as html_escape
 from zoneinfo import ZoneInfo
 
 import discord
@@ -83,6 +82,23 @@ stats = {
     "started_at": time.time(),
 }
 _stats_lock = threading.Lock()
+
+# Rolling in-memory feed of triggered alerts, for the app's live view (not persisted — this is
+# for "what just got flagged" while the app is open, unlike the durable seen/market-tracking files).
+MAX_RECENT_ALERTS = 50
+RECENT_ALERTS = []
+_recent_alerts_lock = threading.Lock()
+
+def _record_recent_alert(title, price, url, filt):
+    with _recent_alerts_lock:
+        RECENT_ALERTS.append({
+            "title": title,
+            "price": price,
+            "url": url,
+            "filter": filt.get("label") or filt["name"],
+            "alerted_at": datetime.now(timezone.utc).isoformat(),
+        })
+        del RECENT_ALERTS[:-MAX_RECENT_ALERTS]
 
 # --- Debug mode ---
 debug_mode = False
@@ -396,6 +412,7 @@ def send_alert(title, price, url, filt, item):
 
     with _stats_lock:
         stats["alerts_sent"] += 1
+    _record_recent_alert(title, price, url, filt)
     _log(f"🔔 Alert: [{filt['name']}] {title} — ${price:.2f}" + (f" ({age})" if age else ""))
 
 def build_status_embed():
@@ -577,20 +594,6 @@ def send_test_feed(entries):
             {"embeds": [{"title": f"🧪 Unfiltered RAM feed — {len(batch)} listing(s)", "color": 0x99AAB5, "fields": batch}]},
             webhook_url=TEST_DISCORD_WEBHOOK,
         )
-
-def _format_duration(secs):
-    if secs is None:
-        return "unknown"
-    if secs < 60:
-        return f"{secs}s"
-    mins, secs = divmod(secs, 60)
-    if mins < 60:
-        return f"{mins}m {secs}s"
-    hours, mins = divmod(mins, 60)
-    if hours < 24:
-        return f"{hours}h {mins}m"
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h"
 
 def scan():
     token = None
@@ -894,9 +897,9 @@ def deletion():
         return jsonify({"challengeResponse": m.hexdigest()}), 200
     return "", 200
 
-# --- Market trends page ---
-@app.route("/market-trends")
-def market_trends():
+# --- Status + market trends JSON API (for the Android home-screen widget) ---
+@app.route("/api/status")
+def api_status():
     with _market_lock:
         log = list(reversed(SOLD_LOG))  # newest gone first
 
@@ -904,65 +907,41 @@ def market_trends():
     avg_secs = int(sum(durations) / len(durations)) if durations else None
 
     config = load_config()
-    price_cap = max((f["max_price"] for f in config.get("filters", [])), default=None)
+    broadcast = config.get("broadcast", {})
+    filters = config.get("filters", [])
+    calls_today, projected = get_api_projection()
+    awake = is_awake()
+    state = "paused" if paused else ("running" if awake else "sleeping")
 
-    rows = []
-    for e in log:
-        price = e.get("price")
-        price_str = f"${price:.2f}" if price is not None else "?"
-        matched = html_escape(", ".join(e.get("matched_filters", [])) or "—")
-        try:
-            created_str = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00")).astimezone(SCANNER_TZ).strftime("%Y-%m-%d %I:%M %p")
-        except Exception:
-            created_str = "?"
-        try:
-            gone_str = datetime.fromisoformat(e["gone_at"]).astimezone(SCANNER_TZ).strftime("%Y-%m-%d %I:%M %p")
-        except Exception:
-            gone_str = "?"
-        rows.append(
-            "<tr>"
-            f"<td>{html_escape(e.get('title', ''))}</td>"
-            f"<td>{price_str}</td>"
-            f"<td>{matched}</td>"
-            f"<td>{created_str}</td>"
-            f"<td>{gone_str}</td>"
-            f"<td>{_format_duration(e.get('duration_secs'))}</td>"
-            "</tr>"
-        )
+    recent = [
+        {
+            "title": e.get("title", ""),
+            "price": e.get("price"),
+            "matched_filters": e.get("matched_filters", []),
+            "duration_secs": e.get("duration_secs"),
+        }
+        for e in log[:5]
+    ]
 
-    table_rows = "\n".join(rows) or "<tr><td colspan=6>No data yet — check back after listings have cycled off eBay.</td></tr>"
-    cap_note = f"under the ${price_cap:.0f} price cap" if price_cap else "under the tracked price cap"
+    with _recent_alerts_lock:
+        recent_alerts = list(reversed(RECENT_ALERTS[-10:]))  # newest first
 
-    return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>RAM Market Trends</title>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #111; color: #eee; }}
-table {{ border-collapse: collapse; width: 100%; }}
-th, td {{ border: 1px solid #444; padding: 6px 10px; text-align: left; font-size: 14px; }}
-th {{ background: #222; }}
-tr:nth-child(even) {{ background: #1a1a1a; }}
-h1 {{ font-size: 1.4rem; }}
-.note {{ color: #999; font-size: 0.85rem; max-width: 700px; }}
-</style>
-</head>
-<body>
-<h1>RAM Market Trends</h1>
-<p class="note">
-Tracks every listing that disappeared from active eBay search results in the scanned category,
-{cap_note}. "Disappeared" is used as a proxy for sold/ended since the Browse API only exposes active
-listings, not confirmed sale data — this can occasionally include expired, removed, or relisted items,
-not just genuine sales. Data resets on every redeploy.
-</p>
-<p><b>{len(log)}</b> tracked so far. Average time to go: <b>{_format_duration(avg_secs)}</b></p>
-<table>
-<tr><th>Title</th><th>Price</th><th>Matched Filter</th><th>Listed At</th><th>Gone At</th><th>Time to Go</th></tr>
-{table_rows}
-</table>
-</body>
-</html>"""
+    return jsonify({
+        "recent_alerts": recent_alerts,
+        "state": state,
+        "poll_interval": broadcast.get("poll_interval", DEFAULT_POLL_INTERVAL),
+        "active_filters": len(filters),
+        "alerts_sent": stats["alerts_sent"],
+        "last_scan_secs_ago": int(time.time() - stats["last_scan_at"]) if stats["last_scan_at"] else None,
+        "api_calls_today": calls_today,
+        "api_daily_limit": EBAY_DAILY_LIMIT,
+        "api_calls_projected_24h": projected,
+        "market": {
+            "tracked_count": len(log),
+            "avg_duration_secs": avg_secs,
+            "recent": recent,
+        },
+    })
 
 # --- Startup (no blocking calls here) ---
 threading.Thread(target=run_bot, daemon=True).start()
