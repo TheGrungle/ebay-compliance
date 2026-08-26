@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -15,12 +16,13 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- Constants ---
-SEEN_FILE = "seen_listings.json"
 SEARCHES_FILE = "searches.json"
+SEEN_FILE = "seen_listings.json"
 MAX_SEEN = 5000
-SCAN_INTERVAL = 30
+DEFAULT_POLL_INTERVAL = 15
 TOKEN_TTL = 5400
 STATUS_INTERVAL = 3600
+SLEEP_CHECK_INTERVAL = 60  # how often to re-check the clock while asleep/paused
 EBAY_DAILY_LIMIT = 5000
 NO_PRICE = float("inf")  # used when eBay returns no price (always fails max_price check)
 
@@ -29,6 +31,13 @@ EXCLUSIONS = [
     "for parts", "parts only", "not working", "as is",
     "ddr5", "ddr3", "ddr2", "sodimm",
 ]
+
+# --- Awake-hours schedule ---
+# Weekdays (Mon-Fri): 7:00-23:00. Weekends (Sat-Sun): 9:00 through 2:00 the next morning.
+WEEKDAY_START_HOUR = 7
+WEEKDAY_END_HOUR = 23
+WEEKEND_START_HOUR = 9
+WEEKEND_END_HOUR = 2  # next calendar day
 
 # --- Env vars ---
 def _require(name):
@@ -44,6 +53,10 @@ DISCORD_BOT_TOKEN      = _require("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID     = int(_require("DISCORD_CHANNEL_ID"))
 DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
 DISCORD_GUILD_ID       = int(_require("DISCORD_GUILD_ID"))
+
+# IANA timezone the awake-hours schedule is evaluated in. MUST match where you actually live —
+# set this in Render's env vars. Defaults to Central time if unset.
+SCANNER_TZ = ZoneInfo(os.environ.get("SCANNER_TZ", "America/Chicago"))
 
 # Sensitive — env vars with backwards-compat fallbacks. Add these to Render to remove from source.
 VERIFICATION_TOKEN = os.environ.get(
@@ -61,11 +74,12 @@ stats = {
     "last_scan_at": 0,
     "started_at": time.time(),
 }
+_stats_lock = threading.Lock()
 
 # --- Debug mode ---
 debug_mode = False
 
-# --- Pause flag ---
+# --- Pause flag (manual, via /pause) ---
 paused = False
 
 # --- eBay API call tracking ---
@@ -111,19 +125,36 @@ def get_api_projection():
     projected = int(calls_today + rate_per_sec * remaining_secs)
     return calls_today, projected
 
-# --- Searches config ---
-_searches_lock = threading.Lock()
+# --- Awake-hours schedule ---
+def is_awake(dt=None):
+    dt = dt or datetime.now(SCANNER_TZ)
+    dow = dt.weekday()  # Mon=0 ... Sun=6
+    hour = dt.hour
 
-def load_searches():
+    if dow <= 4:  # Mon-Fri
+        awake = WEEKDAY_START_HOUR <= hour < WEEKDAY_END_HOUR
+        if dow == 0:  # Monday: tail end of Sunday night's weekend window
+            awake = awake or hour < WEEKEND_END_HOUR
+        return awake
+    else:  # Sat=5, Sun=6
+        awake = hour >= WEEKEND_START_HOUR
+        if dow == 6:  # Sunday: tail end of Saturday night's weekend window
+            awake = awake or hour < WEEKEND_END_HOUR
+        return awake
+
+# --- Config (broadcast search + filters) ---
+_config_lock = threading.Lock()
+
+def load_config():
     try:
         with open(SEARCHES_FILE) as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return []
+        return {"broadcast": {}, "filters": []}
 
-def save_searches(searches):
+def save_config(config):
     with open(SEARCHES_FILE, "w") as f:
-        json.dump(searches, f, indent=2)
+        json.dump(config, f, indent=2)
 
 # --- Seen listings (ordered: dict in Python 3.7+ preserves insertion order, O(1) lookups) ---
 def _load_seen():
@@ -225,48 +256,60 @@ def get_listing_age(item):
 
 # --- Alerts & status ---
 def send_startup_message():
-    searches = load_searches()
+    config = load_config()
+    broadcast = config.get("broadcast", {})
+    filters = config.get("filters", [])
     lines = "\n".join(
-        f"• **{s['name']}** — max ${s['max_price']} | every {s.get('poll_interval', 30)}s"
-        for s in searches
-    ) or "No searches configured."
+        f"• **{f['name']}** — max ${f['max_price']}"
+        for f in filters
+    ) or "No filters configured."
     pid = os.getpid()
     _discord({
         "embeds": [{
             "title": "🟢 eBay Scanner is live",
-            "description": f"**PID: `{pid}`**\n\n**Active searches:**\n{lines}",
+            "description": (
+                f"**PID: `{pid}`**\n\n"
+                f"**Broadcast query:** `{broadcast.get('query', '(none)')}` every {broadcast.get('poll_interval', DEFAULT_POLL_INTERVAL)}s\n\n"
+                f"**Filters:**\n{lines}"
+            ),
             "color": 0x00FF00,
         }]
     })
     _log(f"🟢 Scanner started (PID {pid}).")
 
-def send_alert(title, price, url, search, item):
+def send_alert(title, price, url, filt, item):
     age = get_listing_age(item)
     item_id = item.get("itemId", "?")
     fields = [
-        {"name": "Price",   "value": f"${price:.2f}",                         "inline": True},
-        {"name": "Search",  "value": search.get("label") or search["name"],   "inline": True},
-        {"name": "Item ID", "value": f"`{item_id}`",                          "inline": True},
+        {"name": "Price",   "value": f"${price:.2f}",                       "inline": True},
+        {"name": "Search",  "value": filt.get("label") or filt["name"],     "inline": True},
+        {"name": "Item ID", "value": f"`{item_id}`",                        "inline": True},
     ]
     if age:
         fields.append({"name": "Listed", "value": age, "inline": True})
 
-    _discord({
+    payload = {
         "embeds": [{
             "title": title,
             "url": url,
-            "color": search.get("color", 0x00BFFF),
+            "color": filt.get("color", 0x00BFFF),
             "fields": fields,
         }]
-    })
-    stats["alerts_sent"] += 1
-    _log(f"🔔 Alert: [{search['name']}] {title} — ${price:.2f}" + (f" ({age})" if age else ""))
+    }
+    # Fire-and-forget: a slow/rate-limited webhook must never stall the scan loop.
+    threading.Thread(target=_discord, args=(payload,), daemon=True).start()
+
+    with _stats_lock:
+        stats["alerts_sent"] += 1
+    _log(f"🔔 Alert: [{filt['name']}] {title} — ${price:.2f}" + (f" ({age})" if age else ""))
 
 def build_status_embed():
     uptime = int(time.time() - stats["started_at"])
     hours, rem = divmod(uptime, 3600)
     minutes = rem // 60
-    searches = load_searches()
+    config = load_config()
+    broadcast = config.get("broadcast", {})
+    filters = config.get("filters", [])
     calls_today, projected = get_api_projection()
     pct = f"{calls_today / EBAY_DAILY_LIMIT * 100:.1f}%"
     proj_str = f"{projected:,}" if projected is not None else "calculating..."
@@ -275,53 +318,56 @@ def build_status_embed():
     last_scan_secs = int(time.time() - stats["last_scan_at"]) if stats["last_scan_at"] else None
     last_scan_str = f"{last_scan_secs}s ago" if last_scan_secs is not None else "never"
 
-    title = "📊 Scanner Status"
+    awake = is_awake()
     if paused:
         title = "⏸️ Scanner Status (PAUSED)"
+        color = 0x808080
+    elif not awake:
+        title = "😴 Scanner Status (SLEEPING)"
+        color = 0x2C2F33
+    else:
+        title = "📊 Scanner Status"
+        color = 0xFF4500 if (projected or 0) > EBAY_DAILY_LIMIT else 0x5865F2
 
     return {
         "embeds": [{
             "title": title,
-            "color": 0xFF4500 if (projected or 0) > EBAY_DAILY_LIMIT else (0x808080 if paused else 0x5865F2),
+            "color": color,
             "fields": [
                 {"name": "Uptime",            "value": f"{hours}h {minutes}m",         "inline": True},
                 {"name": "Last Scan",         "value": last_scan_str,                   "inline": True},
                 {"name": "Alerts Sent",       "value": str(stats["alerts_sent"]),       "inline": True},
                 {"name": "API Calls Today",   "value": f"{calls_today:,} / {EBAY_DAILY_LIMIT:,} ({pct})", "inline": True},
                 {"name": f"Projected 24h{warn}", "value": proj_str,                    "inline": True},
-                {"name": "Active Searches",   "value": str(len(searches)),              "inline": True},
+                {"name": "Poll Interval",     "value": f"{broadcast.get('poll_interval', DEFAULT_POLL_INTERVAL)}s", "inline": True},
+                {"name": "Active Filters",    "value": str(len(filters)),               "inline": True},
             ],
         }]
     }
 
 # --- Scanner ---
-def _matches(title, search):
+def _matches(title, filt):
     t = title.lower()
-    # Global RAM exclusions only apply if this is a RAM-category search
-    if search.get("category_id") == "170083":
-        if any(x in t for x in EXCLUSIONS):
-            return False
-    # Per-search exclusions apply to all searches
-    for x in search.get("exclude", []):
+    for x in filt.get("exclude", []):
         if x.lower() in t:
             return False
-    must = search.get("must_contain", [])
+    must = filt.get("must_contain", [])
     if must and not any(k.lower() in t for k in must):
         return False
     return True
 
-def _fetch_search(token, search):
-    """Network-only: hit eBay for one search. Runs in a worker thread.
-       Returns (search, items, error)."""
+def _fetch_broadcast(token, broadcast, filters):
+    """One API call for the whole cycle: broad query, capped at the highest filter's max_price."""
+    max_price = max((f["max_price"] for f in filters), default=1000)
     params = {
-        "q": search["query"],
-        "filter": f"price:[..{search['max_price']}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
+        "q": broadcast.get("query", ""),
+        "filter": f"price:[..{max_price}],priceCurrency:USD,conditions:{{NEW|USED_EXCELLENT|USED_GOOD|USED_ACCEPTABLE}}",
         "sort": "newlyListed",
         "limit": "50",
         "fieldgroups": "EXTENDED",
     }
-    if search.get("category_id"):
-        params["category_ids"] = search["category_id"]
+    if broadcast.get("category_id"):
+        params["category_ids"] = broadcast["category_id"]
 
     try:
         record_api_call()
@@ -332,226 +378,210 @@ def _fetch_search(token, search):
             timeout=15,
         )
         r.raise_for_status()
-        return search, r.json().get("itemSummaries", []), None
+        return r.json().get("itemSummaries", []), None
     except Exception as e:
-        return search, [], e
+        return [], e
 
-def _process_results(search, items):
-    """Filter, dedupe, alert. Runs in the main scanner thread (single-threaded)."""
+def _process_results(items, filters, broadcast):
+    """Dedupe against the global seen set, then run every filter against each new item in code."""
     new_count = 0
+    is_ram_category = broadcast.get("category_id") == "170083"
+
     for item in items:
         item_id = item.get("itemId")
         title = item.get("title", "")
+        t = title.lower()
         price_val = item.get("price", {}).get("value")
         price = float(price_val) if price_val is not None else NO_PRICE
 
-        if debug_mode:
-            seen = item_id in SEEN_LISTINGS
-            matches = _matches(title, search)
-            _log(
-                f"[DEBUG][{search['name']}] {'SEEN' if seen else 'NEW'} | "
-                f"{'MATCH' if matches else 'NO MATCH'} | "
-                f"${price:.2f} | {title[:60]}"
-            )
-
         if item_id in SEEN_LISTINGS:
+            if debug_mode:
+                _log(f"[DEBUG] SEEN | ${price:.2f} | {title[:60]}")
             continue
 
         _add_seen(item_id)
         new_count += 1
 
-        url = item.get("itemWebUrl", "")
+        if is_ram_category and any(x in t for x in EXCLUSIONS):
+            if debug_mode:
+                _log(f"[DEBUG] EXCLUDED | ${price:.2f} | {title[:60]}")
+            continue
 
         age_secs = get_listing_age_seconds(item)
         if age_secs is not None and age_secs > MAX_LISTING_AGE:
             if debug_mode:
-                _log(f"[DEBUG][{search['name']}] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
+                _log(f"[DEBUG] SKIPPED (too old: {age_secs // 3600}h) | {title[:60]}")
             continue
 
-        if _matches(title, search):
-            send_alert(title, price, url, search, item)
+        url = item.get("itemWebUrl", "")
+        matched_any = False
+        for filt in filters:
+            if price > filt["max_price"]:
+                continue
+            if _matches(title, filt):
+                matched_any = True
+                send_alert(title, price, url, filt, item)
+
+        if debug_mode:
+            _log(f"[DEBUG] {'MATCH' if matched_any else 'NO MATCH'} | ${price:.2f} | {title[:60]}")
 
     return new_count
 
 def scan():
-    try:
-        token = get_access_token()
-        _log("✅ eBay token acquired.")
-    except Exception as e:
-        _log(f"❌ Fatal: could not get initial eBay token: {e}")
-        return
-
-    token_time = time.time()
+    token = None
+    token_time = 0
     last_status = time.time()
-    last_polled = {}  # search name -> last poll timestamp
+    was_awake = None  # None = not yet determined, forces an initial log line
 
     while True:
         cycle_start = time.time()
+        awake = is_awake()
 
-        if paused:
-            time.sleep(SCAN_INTERVAL)
+        if awake != was_awake:
+            if awake:
+                _log("☀️ Awake hours started — scanner resuming.")
+                if was_awake is not None:
+                    _discord({"embeds": [{"title": "☀️ Scanner waking up", "color": 0xFFD700}]})
+            else:
+                _log("😴 Awake hours ended — scanner sleeping.")
+                if was_awake is not None:
+                    _discord({"embeds": [{"title": "😴 Scanner sleeping until next awake window", "color": 0x2C2F33}]})
+            was_awake = awake
+
+        if paused or not awake:
+            time.sleep(SLEEP_CHECK_INTERVAL)
             continue
 
-        if time.time() - token_time > TOKEN_TTL:
+        if token is None or time.time() - token_time > TOKEN_TTL:
             try:
                 token = get_access_token()
                 token_time = time.time()
-                _log("🔄 eBay token refreshed.")
+                _log("✅ eBay token acquired." if token_time == cycle_start else "🔄 eBay token refreshed.")
             except Exception as e:
-                _log(f"⚠️ Token refresh failed: {e}")
+                _log(f"⚠️ Token error: {e}")
+                time.sleep(15)
+                continue
 
         if time.time() - last_status >= STATUS_INTERVAL:
             _discord(build_status_embed())
             _log("📊 Hourly status posted.")
             last_status = time.time()
 
-        with _searches_lock:
-            searches = load_searches()
+        with _config_lock:
+            config = load_config()
+        broadcast = config.get("broadcast", {})
+        filters = config.get("filters", [])
 
-        new_this_cycle = 0
-        dirty = False
-        now = time.time()
-
-        for search in searches:
-            poll_interval = search.get("poll_interval", SCAN_INTERVAL)
-            if now - last_polled.get(search["name"], 0) < poll_interval:
-                continue
-            last_polled[search["name"]] = now
-
-            stats["last_scan_at"] = time.time()
-            _, items, err = _fetch_search(token, search)
-            if err:
-                _log(f"❌ Scan error [{search['name']}]: {err}")
-                continue
-
-            count = _process_results(search, items)
+        stats["last_scan_at"] = time.time()
+        items, err = _fetch_broadcast(token, broadcast, filters)
+        if err:
+            _log(f"❌ Scan error: {err}")
+        else:
+            count = _process_results(items, filters, broadcast)
             if count:
-                dirty = True
-                new_this_cycle += count
+                _log(f"🔍 {count} new item(s).")
+                _save_seen(SEEN_LISTINGS)
 
-        if new_this_cycle:
-            _log(f"🔍 {new_this_cycle} new item(s).")
-
-        if dirty:
-            _save_seen(SEEN_LISTINGS)
-
-        # Tight sleep: keep cycle start-to-start ~exactly SCAN_INTERVAL, never longer
+        poll_interval = broadcast.get("poll_interval", DEFAULT_POLL_INTERVAL)
         elapsed = time.time() - cycle_start
-        time.sleep(max(0, SCAN_INTERVAL - elapsed))
+        time.sleep(max(0, poll_interval - elapsed))
 
 # --- Discord bot ---
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
-search_group = app_commands.Group(name="search", description="Manage eBay searches")
+search_group = app_commands.Group(name="search", description="Manage eBay result filters")
+broadcast_group = app_commands.Group(name="broadcast", description="Manage the shared eBay broadcast search")
 
-@search_group.command(name="list", description="List all active searches")
+@search_group.command(name="list", description="List all active filters")
 async def search_list(interaction: discord.Interaction):
-    searches = load_searches()
-    if not searches:
-        await interaction.response.send_message("No searches configured.", ephemeral=True)
+    filters = load_config().get("filters", [])
+    if not filters:
+        await interaction.response.send_message("No filters configured.", ephemeral=True)
         return
     lines = []
-    for i, s in enumerate(searches):
-        must = ", ".join(s.get("must_contain", [])) or "any"
-        interval = s.get("poll_interval", 30)
-        lines.append(f"**{i+1}. {s['name']}**\nQuery: `{s['query']}`\nMax: ${s['max_price']} | Poll: every {interval}s | Keywords: {must}\n")
+    for i, f in enumerate(filters):
+        must = ", ".join(f.get("must_contain", [])) or "any"
+        lines.append(f"**{i+1}. {f['name']}**\nMax: ${f['max_price']} | Keywords: {must}\n")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
-@search_group.command(name="add", description="Add a new search")
+@search_group.command(name="add", description="Add a new filter")
 @app_commands.describe(
-    name="Friendly name for this search",
-    query="eBay search query",
+    name="Friendly name for this filter",
     max_price="Maximum price",
     must_contain="Comma-separated title keywords (any match required, optional)",
     label="Alert label text (optional)",
     color="Embed color as decimal integer (optional, default 49151)",
-    poll_interval="How often to poll in seconds, multiples of 30 (optional, default 30)",
-    category_id="eBay category ID (optional - leave blank to search all categories)",
 )
 async def search_add(
     interaction: discord.Interaction,
     name: str,
-    query: str,
     max_price: float,
     must_contain: str = "",
     label: str = "",
     color: int = 49151,
-    poll_interval: int = 30,
-    category_id: str = "",
 ):
-    poll_interval = max(30, (poll_interval // 30) * 30)
-    with _searches_lock:
-        searches = load_searches()
-        if any(s["name"].lower() == name.lower() for s in searches):
-            await interaction.response.send_message(f"A search named **{name}** already exists.", ephemeral=True)
+    with _config_lock:
+        config = load_config()
+        filters = config.setdefault("filters", [])
+        if any(f["name"].lower() == name.lower() for f in filters):
+            await interaction.response.send_message(f"A filter named **{name}** already exists.", ephemeral=True)
             return
-        new_search = {
+        filters.append({
             "name": name,
-            "query": query,
             "max_price": max_price,
-            "poll_interval": poll_interval,
             "must_contain": [k.strip() for k in must_contain.split(",") if k.strip()],
             "label": label or name,
             "color": color,
-        }
-        if category_id:
-            new_search["category_id"] = category_id
-        searches.append(new_search)
-        save_searches(searches)
+        })
+        save_config(config)
 
-    cat_str = f" in category {category_id}" if category_id else " (all categories)"
-    _log(f"➕ Search added: {name} (max ${max_price}, every {poll_interval}s{cat_str})")
-    await interaction.response.send_message(f"✅ Search **{name}** added.", ephemeral=True)
+    _log(f"➕ Filter added: {name} (max ${max_price})")
+    await interaction.response.send_message(f"✅ Filter **{name}** added.", ephemeral=True)
 
-@search_group.command(name="remove", description="Remove a search by name")
-@app_commands.describe(name="Name of the search to remove")
+@search_group.command(name="remove", description="Remove a filter by name")
+@app_commands.describe(name="Name of the filter to remove")
 async def search_remove(interaction: discord.Interaction, name: str):
-    with _searches_lock:
-        searches = load_searches()
-        updated = [s for s in searches if s["name"].lower() != name.lower()]
-        if len(updated) == len(searches):
-            await interaction.response.send_message(f"No search named **{name}** found.", ephemeral=True)
+    with _config_lock:
+        config = load_config()
+        filters = config.get("filters", [])
+        updated = [f for f in filters if f["name"].lower() != name.lower()]
+        if len(updated) == len(filters):
+            await interaction.response.send_message(f"No filter named **{name}** found.", ephemeral=True)
             return
-        save_searches(updated)
+        config["filters"] = updated
+        save_config(config)
 
-    _log(f"➖ Search removed: {name}")
-    await interaction.response.send_message(f"✅ Search **{name}** removed.", ephemeral=True)
+    _log(f"➖ Filter removed: {name}")
+    await interaction.response.send_message(f"✅ Filter **{name}** removed.", ephemeral=True)
 
-@search_group.command(name="edit", description="Edit an existing search")
+@search_group.command(name="edit", description="Edit an existing filter")
 @app_commands.describe(
-    name="Name of the search to edit",
+    name="Name of the filter to edit",
     new_name="New name (optional)",
-    query="New eBay search query (optional)",
     max_price="New maximum price (optional)",
     must_contain="New comma-separated keywords (optional)",
     label="New alert label text (optional)",
     color="New embed color as decimal integer (optional)",
-    poll_interval="New poll interval in seconds, multiples of 30 (optional)",
-    category_id="New eBay category ID (optional, use 'none' to clear and search all categories)",
 )
 async def search_edit(
     interaction: discord.Interaction,
     name: str,
     new_name: str = "",
-    query: str = "",
     max_price: float = None,
     must_contain: str = "",
     label: str = "",
     color: int = None,
-    poll_interval: int = None,
-    category_id: str = "",
 ):
-    with _searches_lock:
-        searches = load_searches()
-        match = next((s for s in searches if s["name"].lower() == name.lower()), None)
+    with _config_lock:
+        config = load_config()
+        filters = config.get("filters", [])
+        match = next((f for f in filters if f["name"].lower() == name.lower()), None)
         if not match:
-            await interaction.response.send_message(f"No search named **{name}** found.", ephemeral=True)
+            await interaction.response.send_message(f"No filter named **{name}** found.", ephemeral=True)
             return
         if new_name:
             match["name"] = new_name
-        if query:
-            match["query"] = query
         if max_price is not None:
             match["max_price"] = max_price
         if must_contain:
@@ -560,18 +590,47 @@ async def search_edit(
             match["label"] = label
         if color is not None:
             match["color"] = color
-        if poll_interval is not None:
-            match["poll_interval"] = max(30, (poll_interval // 30) * 30)
-        if category_id:
-            if category_id.lower() == "none":
-                match.pop("category_id", None)
-            else:
-                match["category_id"] = category_id
-        save_searches(searches)
+        save_config(config)
 
     display = new_name or name
-    _log(f"✏️ Search edited: {name} → {display}")
-    await interaction.response.send_message(f"✅ Search **{display}** updated.", ephemeral=True)
+    _log(f"✏️ Filter edited: {name} → {display}")
+    await interaction.response.send_message(f"✅ Filter **{display}** updated.", ephemeral=True)
+
+@broadcast_group.command(name="show", description="Show the current broadcast search settings")
+async def broadcast_show(interaction: discord.Interaction):
+    b = load_config().get("broadcast", {})
+    await interaction.response.send_message(
+        f"**Query:** `{b.get('query', '(none)')}`\n"
+        f"**Category:** {b.get('category_id') or 'all'}\n"
+        f"**Poll interval:** every {b.get('poll_interval', DEFAULT_POLL_INTERVAL)}s",
+        ephemeral=True,
+    )
+
+@broadcast_group.command(name="edit", description="Edit the shared broadcast search")
+@app_commands.describe(
+    query="New eBay search query (optional)",
+    category_id="New eBay category ID, use 'none' to search all categories (optional)",
+    poll_interval="New poll interval in seconds (optional, minimum 5)",
+)
+async def broadcast_edit(
+    interaction: discord.Interaction,
+    query: str = "",
+    category_id: str = "",
+    poll_interval: int = None,
+):
+    with _config_lock:
+        config = load_config()
+        b = config.setdefault("broadcast", {})
+        if query:
+            b["query"] = query
+        if category_id:
+            b["category_id"] = None if category_id.lower() == "none" else category_id
+        if poll_interval is not None:
+            b["poll_interval"] = max(5, poll_interval)
+        save_config(config)
+
+    _log(f"✏️ Broadcast search updated by {interaction.user}: {b}")
+    await interaction.response.send_message("✅ Broadcast search updated.", ephemeral=True)
 
 @tree.command(name="status", description="Get current scanner stats")
 async def status_command(interaction: discord.Interaction):
@@ -599,6 +658,7 @@ async def pause_command(interaction: discord.Interaction):
     await interaction.response.send_message(f"Scanner is now **{state}**.", ephemeral=True)
 
 tree.add_command(search_group)
+tree.add_command(broadcast_group)
 
 @bot.event
 async def on_ready():

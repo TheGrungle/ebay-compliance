@@ -12,10 +12,31 @@ A Python app hosted on Render that monitors eBay for DDR4 RAM deals and sends Di
 ## Architecture
 Single file (`app.py`) running three concurrent threads:
 1. **Flask** — handles eBay's marketplace account deletion compliance endpoint (`/ebay-deletion`)
-2. **Scanner** — polls eBay Browse API every 30s (per-search configurable), sends Discord alerts via webhook
+2. **Scanner** — makes ONE broad eBay Browse API call per poll cycle (~15s), then runs every configured filter against the results in code. Sends Discord alerts via webhook.
 3. **Discord bot** — handles slash commands, posts to the logs channel
 
-## Environment Variables (all required in Render)
+### Why "broadcast + filter" instead of one API call per search
+The old design ran a separate eBay API call per search config. Two searches at 30s = ~2,880 calls/day,
+which capped how fast polling could go before hitting the 5,000/day limit. Now there's exactly **one**
+broad query per cycle (e.g. `"DDR4 RAM"` in the RAM category), and all the specific matching (2x16 kit,
+2x32 kit, price caps, keyword requirements) happens in code against that single result set. Adding more
+filters costs zero extra API calls, which is what makes ~15s polling affordable.
+
+## Awake-hours schedule
+The scanner only polls eBay (and only counts against the daily API budget) during the hours below,
+evaluated in the `SCANNER_TZ` timezone. Outside these hours it sleeps and checks the clock every 60s —
+no API calls, no wasted budget.
+- **Weekdays (Mon-Fri):** 7:00 - 23:00
+- **Weekends (Sat-Sun):** 9:00 through 2:00 the following morning (i.e. Saturday 9am → Sunday 2am, Sunday 9am → Monday 2am)
+
+Posts a "waking up" / "sleeping" embed to Discord on each transition. Manual `/pause` is independent of
+this schedule and overrides it either way.
+
+**Budget check:** one call per 15s only during awake hours ≈ 3,840 calls/day on weekdays, ~4,080 on
+weekends — both comfortably under the 5,000/day limit, with the two big API-cost drivers (redundant
+per-search calls, always-on polling) both eliminated by this redesign.
+
+## Environment Variables (all required in Render unless noted)
 | Variable | Description |
 |---|---|
 | `EBAY_APP_ID` | eBay developer app ID |
@@ -25,66 +46,89 @@ Single file (`app.py`) running three concurrent threads:
 | `DISCORD_CHANNEL_ID` | Main alerts channel ID |
 | `DISCORD_LOG_CHANNEL_ID` | Logs channel ID (1503493724611547277) |
 | `DISCORD_GUILD_ID` | Server ID (1445992804760293499) |
+| `SCANNER_TZ` | **IANA timezone for the awake-hours schedule (e.g. `America/New_York`, `America/Chicago`). Optional — defaults to `America/Chicago` if unset.** |
 | `PYTHON_VERSION` | Must be `3.12.0` |
 
 ## Key Files
 - `app.py` — entire application
-- `searches.json` — search configs, read every 30s (no redeploy needed to change)
+- `searches.json` — broadcast query + filters, read every cycle (no redeploy needed to change)
 - `seen_listings.json` — persisted set of already-alerted item IDs (ephemeral on Render — wiped on redeploy)
-- `requirements.txt` — flask, gunicorn==21.2.0, requests, discord.py
+- `requirements.txt` — flask, gunicorn==21.2.0, requests, discord.py, tzdata
 - `runtime.txt` — python-3.12.0 (Render may ignore this; use PYTHON_VERSION env var instead)
 - `Procfile` — gunicorn start command with explicit port and logging
 
-## Search Config (`searches.json`)
-Each search object has:
+## Config (`searches.json`)
 ```json
 {
-  "name": "Friendly name",
-  "query": "eBay search query string",
-  "category_id": "170083",
-  "max_price": 70,
-  "poll_interval": 30,
-  "must_contain": ["keyword1", "keyword2"],
-  "label": "⚡ Alert label",
-  "color": 49151
+  "broadcast": {
+    "query": "DDR4 RAM",
+    "category_id": "170083",
+    "poll_interval": 15
+  },
+  "filters": [
+    {
+      "name": "Friendly name",
+      "max_price": 70,
+      "must_contain": ["keyword1", "keyword2"],
+      "exclude": ["optional per-filter exclusion"],
+      "label": "⚡ Alert label",
+      "color": 49151
+    }
+  ]
 }
 ```
-- `poll_interval` must be a multiple of 30 (seconds)
-- Changes to this file take effect within 30s without redeploying
+- **`broadcast`** is the single eBay API call made each cycle. `poll_interval` is in seconds (no longer
+  constrained to multiples of 30 — minimum enforced is 5s). The price cap sent to eBay is computed
+  automatically each cycle as the max of all filters' `max_price`, so you never have to keep it in sync
+  by hand.
+- **`filters`** are applied in code against every item from that one broadcast call — no additional API
+  calls per filter. Each item is checked against every filter and can trigger multiple alerts if it
+  matches more than one.
+- Changes to this file take effect within one poll cycle without redeploying.
 - **Caveat:** edits made via Discord commands are wiped on redeploy. Push `searches.json` to GitHub to make defaults permanent.
 
 ## Discord Slash Commands
 | Command | Description |
 |---|---|
-| `/status` | Posts scanner stats embed to main channel |
+| `/status` | Posts scanner stats embed to main channel (shows RUNNING / PAUSED / SLEEPING) |
 | `/echo` | Responds with "echo" — used to verify bot is alive |
 | `/debug` | Toggles verbose scan logging to logs channel |
-| `/search list` | Lists all active searches |
-| `/search add` | Adds a new search |
-| `/search remove` | Removes a search by name |
-| `/search edit` | Edits any field of an existing search |
+| `/pause` | Manually toggles the scanner on/off, independent of the awake-hours schedule |
+| `/broadcast show` | Shows the current broadcast query/category/poll interval |
+| `/broadcast edit` | Edits the broadcast query, category, or poll interval |
+| `/search list` | Lists all active filters |
+| `/search add` | Adds a new filter |
+| `/search remove` | Removes a filter by name |
+| `/search edit` | Edits any field of an existing filter |
 
 ## Alert Embeds
-Sent to the main channel via webhook. Include: title (linked to listing), price, deal tier label, search name, and listing age (e.g. "4m old") when available from eBay's API.
+Sent to the main channel via webhook, fired on a background thread so a slow/rate-limited webhook never
+blocks the scan loop. Include: title (linked to listing), price, deal tier label, filter name, and
+listing age (e.g. "4m old") when available from eBay's API.
 
 ## Status Embed
-Sent hourly and on `/status`. Includes: uptime, scans run, alerts sent, eBay API calls today vs 5,000 daily limit, projected 24h usage (turns orange with ⚠️ if on track to exceed limit), active search count.
+Sent hourly while awake, and on `/status`. Includes: uptime, scans run, alerts sent, eBay API calls
+today vs 5,000 daily limit, projected 24h usage (turns orange with ⚠️ if on track to exceed limit),
+poll interval, active filter count, and current state (RUNNING / PAUSED / SLEEPING).
 
 ## eBay API Notes
 - Uses Browse API (`/buy/browse/v1/item_summary/search`)
-- OAuth client credentials flow, token refreshed every 90 minutes
+- OAuth client credentials flow, token refreshed every 90 minutes (only while awake)
 - Daily call limit: **5,000 calls/day**
-- With 2 searches at 30s intervals = ~2,880 calls/day (safe)
+- One broadcast call per poll cycle regardless of filter count — see "Awake-hours schedule" above for the budget math
 - `fieldgroups=EXTENDED` is passed to get `itemCreationDate` for listing age
 
 ## Global Exclusions (hardcoded)
-Listings are skipped if their title contains: `ecc`, `server`, `apple`, `mac`, `macbook`, `rdimm`, `lrdimm`, `for parts`, `parts only`, `not working`, `as is`, `ddr5`, `ddr3`, `ddr2`, `sodimm`
+Applied only when `broadcast.category_id` is `170083` (Desktop Memory). Listings are skipped if their
+title contains: `ecc`, `server`, `apple`, `mac`, `macbook`, `rdimm`, `lrdimm`, `for parts`, `parts only`,
+`not working`, `as is`, `ddr5`, `ddr3`, `ddr2`, `sodimm`
 
 ## Known Limitations
 - `seen_listings.json` is wiped on every Render redeploy — causes a one-time flood of old listings on restart
 - `searches.json` edits via Discord commands don't survive redeploys
 - Fix for both: use a persistent database (Redis or SQLite with Render disk)
 - Render free tier may spin down after inactivity
+- `SCANNER_TZ` must be set correctly or the awake-hours schedule runs at the wrong clock hours for your location
 
 ## Discord Server Info
 - Server ID: 1445992804760293499
