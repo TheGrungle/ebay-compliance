@@ -138,6 +138,14 @@ scan cycle via `_crash_log()`: `"Scanned and found nothing"`, `"Scanned, found <
 is a continuous trail so a gap in it (no lines for however long) shows exactly when the process went
 down and for how long, without mixing that signal into the regular logs.
 
+On every boot, `send_startup_message()` reads the crash log channel's own message history via the bot
+(`_last_crash_log_message_at()`, one `channel.history(limit=1)` call) to find the timestamp of the last
+line posted before this restart, and reports the gap ("Was offline for: ...") in the **logs channel**.
+This is preferred over the `runtime_state.json` heartbeat because it lives on Discord, not local disk —
+it survives an actual redeploy (which wipes the heartbeat file), not just a free-tier spin-down/up. Falls
+back to the heartbeat-derived `OFFLINE_SECS_ON_BOOT` only if the crash log channel isn't configured or
+has no history yet. Requires the bot to have "Read Message History" permission in that channel.
+
 ## Status Embed
 Sent on `/status` only (see "Notification design" above — no longer automatic/hourly). Includes:
 uptime, scans run, alerts sent, eBay API calls today vs 5,000 daily limit, projected 24h usage (turns

@@ -407,6 +407,21 @@ def _crash_log(message):
             print(f"Crash log send error: {e}")
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
 
+async def _last_crash_log_message_at():
+    """UTC created_at of the most recent message in the crash-log channel, or None if that channel
+       isn't configured or has no history yet (e.g. first-ever boot)."""
+    if DISCORD_CRASH_LOG_CHANNEL_ID is None:
+        return None
+    ch = bot.get_channel(DISCORD_CRASH_LOG_CHANNEL_ID)
+    if ch is None:
+        return None
+    try:
+        async for msg in ch.history(limit=1):
+            return msg.created_at
+    except Exception as e:
+        print(f"Crash log history fetch error: {e}")
+    return None
+
 def _log_embed(payload):
     """Like _discord(), but posts to the logs channel via the bot instead of the alerts webhook.
        Used for server-lifecycle/status noise (startup, waking/sleeping, /status) so it never
@@ -467,9 +482,21 @@ def send_startup_message():
     state_line = "🟢 **RUNNING** — inside awake hours, scanning normally." if awake else \
                  "😴 **SLEEPING** — outside awake hours, will not poll eBay until the next awake window."
 
+    # Prefer the crash-log channel's own message history to measure downtime — it's a line roughly
+    # every poll cycle and (unlike runtime_state.json) survives an actual redeploy since it lives on
+    # Discord, not local disk. Fall back to the heartbeat file only if the crash log isn't set up yet.
+    offline_secs = OFFLINE_SECS_ON_BOOT
+    if _bot_loop is not None:
+        try:
+            last_msg_at = asyncio.run_coroutine_threadsafe(_last_crash_log_message_at(), _bot_loop).result(timeout=10)
+            if last_msg_at is not None:
+                offline_secs = max(0, (datetime.now(timezone.utc) - last_msg_at).total_seconds())
+        except Exception as e:
+            print(f"Crash log offline calc error: {e}")
+
     offline_line = ""
-    if OFFLINE_SECS_ON_BOOT is not None:
-        offline_line = f"**Was offline for:** {_format_duration(OFFLINE_SECS_ON_BOOT)}\n\n"
+    if offline_secs is not None:
+        offline_line = f"**Was offline for:** {_format_duration(offline_secs)}\n\n"
 
     _log_embed({
         "embeds": [{
@@ -485,7 +512,7 @@ def send_startup_message():
             "color": 0x00FF00 if awake else 0x2C2F33,
         }]
     })
-    offline_note = f" Was offline {_format_duration(OFFLINE_SECS_ON_BOOT)}." if OFFLINE_SECS_ON_BOOT is not None else ""
+    offline_note = f" Was offline {_format_duration(offline_secs)}." if offline_secs is not None else ""
     _log(f"🟢 Scanner started (PID {pid}) — {'RUNNING' if awake else 'SLEEPING'}.{offline_note}")
 
 def send_alert(title, price, url, filt, item):
