@@ -22,6 +22,7 @@ MARKET_TRACKING_FILE = "market_tracking.json"
 MARKET_SOLD_LOG_FILE = "market_sold_log.json"
 RUNTIME_STATE_FILE = "runtime_state.json"
 HEARTBEAT_INTERVAL = 60  # how often the alive-heartbeat is written to disk, in seconds
+SCAN_SUMMARY_INTERVAL = 900  # 15 min — how often the logs channel gets a lumped scan summary
 MAX_SEEN = 5000
 MAX_SOLD_LOG = 1000
 BROADCAST_LIMIT = 200  # max eBay Browse API allows per call; costs the same 1 API call regardless
@@ -61,6 +62,10 @@ DISCORD_BOT_TOKEN      = _require("DISCORD_BOT_TOKEN")
 DISCORD_CHANNEL_ID     = int(_require("DISCORD_CHANNEL_ID"))
 DISCORD_LOG_CHANNEL_ID = int(_require("DISCORD_LOG_CHANNEL_ID"))
 DISCORD_GUILD_ID       = int(_require("DISCORD_GUILD_ID"))
+# Optional: a one-line-per-scan-cycle firehose channel, used purely to see exactly when/how long the
+# process was down (gaps in this channel = downtime). Leave unset to disable.
+_crash_log_id = os.environ.get("DISCORD_CRASH_LOG_CHANNEL_ID")
+DISCORD_CRASH_LOG_CHANNEL_ID = int(_crash_log_id) if _crash_log_id else None
 
 # IANA timezone the awake-hours schedule is evaluated in. MUST match where you actually live —
 # set this in Render's env vars. Defaults to Central time if unset.
@@ -388,6 +393,20 @@ def _log(message):
             print(f"Log send error: {e}")
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
 
+def _crash_log(message):
+    """One terse line per scan cycle to the (optional) crash-log channel — no aggregation, no emoji.
+       The point is a continuous trail so gaps in it reveal exactly when/how long the process was down."""
+    if _bot_loop is None or DISCORD_CRASH_LOG_CHANNEL_ID is None:
+        return
+    async def _send():
+        try:
+            ch = bot.get_channel(DISCORD_CRASH_LOG_CHANNEL_ID)
+            if ch:
+                await ch.send(message)
+        except Exception as e:
+            print(f"Crash log send error: {e}")
+    asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
+
 def _log_embed(payload):
     """Like _discord(), but posts to the logs channel via the bot instead of the alerts webhook.
        Used for server-lifecycle/status noise (startup, waking/sleeping, /status) so it never
@@ -684,6 +703,11 @@ def scan():
     token_time = 0
     was_awake = None  # None = not yet determined, forces an initial log line
 
+    # Lumped scan summary — cuts per-cycle log spam down to one brief line every SCAN_SUMMARY_INTERVAL.
+    summary_start = time.time()
+    summary_scans = 0
+    summary_finds = 0
+
     while True:
         cycle_start = time.time()
         awake = is_awake()
@@ -720,18 +744,26 @@ def scan():
 
         stats["last_scan_at"] = time.time()
         items, err = _fetch_broadcast(token, broadcast, filters)
+        summary_scans += 1
         if err:
             _log(f"❌ Scan error: {err}")
+            _crash_log(f"Scan failed: {err}")
         else:
             _update_market_tracking(items, filters)
             new_count, excluded_count, matched_count, test_feed = _process_results(items, filters, broadcast)
+            summary_finds += matched_count
             if new_count:
-                _log(
-                    f"🔍 {new_count} new item(s) — {excluded_count} excluded, "
-                    f"{matched_count} matched a filter (alert sent)"
-                )
                 _save_seen(SEEN_LISTINGS)
             send_test_feed(test_feed)
+            _crash_log("Scanned and found nothing" if matched_count == 0 else f"Scanned, found {matched_count}")
+
+        summary_elapsed = time.time() - summary_start
+        if summary_elapsed >= SCAN_SUMMARY_INTERVAL:
+            rate = summary_scans / (summary_elapsed / 60)
+            _log(f"{summary_scans} scans, {summary_finds} found, {rate:.1f} calls/min")
+            summary_start = time.time()
+            summary_scans = 0
+            summary_finds = 0
 
         poll_interval = broadcast.get("poll_interval", DEFAULT_POLL_INTERVAL)
         elapsed = time.time() - cycle_start

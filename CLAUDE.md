@@ -49,6 +49,7 @@ per-search calls, always-on polling) both eliminated by this redesign.
 | `DISCORD_GUILD_ID` | Server ID (1445992804760293499) |
 | `SCANNER_TZ` | **IANA timezone for the awake-hours schedule (e.g. `America/New_York`, `America/Chicago`). Optional — defaults to `America/Chicago` if unset.** |
 | `TEST_DISCORD_WEBHOOK` | Optional. Webhook URL for a second "test channel" that gets every scanned RAM listing — unfiltered, including excluded/non-matching ones — with exact listed time and seconds-since-listed. Unset = feature disabled. |
+| `DISCORD_CRASH_LOG_CHANNEL_ID` | Optional. Channel ID for a one-line-per-scan-cycle firehose (via the bot) — purely so gaps in it show exactly when/how long the process was down. Unset = feature disabled. |
 | `PYTHON_VERSION` | Must be `3.12.0` |
 
 ## Key Files
@@ -124,6 +125,18 @@ the logs channel). Mute/silence notifications for the logs channel in Discord's 
 no code change needed to adjust that. The old hourly automatic status ping was removed entirely (it
 added noise without being actionable); `/status` still works on demand and now posts to the logs
 channel.
+
+**Per-cycle scan noise** used to log a line to the logs channel every cycle that had any new listing
+(common, since the broadcast query is broad) even when nothing matched a filter. That's now lumped into
+one brief line every `SCAN_SUMMARY_INTERVAL` (15 min): `"<scans> scans, <finds> found, <rate> calls/min"`
+— `scans`/`finds`/the rate are all accumulated in `scan()`'s local `summary_*` counters and reset after
+each flush. No per-cycle "0 found" logging happens anymore in the logs channel.
+
+**Crash log channel** (`DISCORD_CRASH_LOG_CHANNEL_ID`, optional) gets one terse, emoji-free line per
+scan cycle via `_crash_log()`: `"Scanned and found nothing"`, `"Scanned, found <N>"`, or
+`"Scan failed: <error>"`. It's deliberately unaggregated and separate from the logs channel — the point
+is a continuous trail so a gap in it (no lines for however long) shows exactly when the process went
+down and for how long, without mixing that signal into the regular logs.
 
 ## Status Embed
 Sent on `/status` only (see "Notification design" above — no longer automatic/hourly). Includes:
