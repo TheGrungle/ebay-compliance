@@ -29,8 +29,9 @@ no API calls, no wasted budget.
 - **Weekdays (Mon-Fri):** 7:00 - 23:00
 - **Weekends (Sat-Sun):** 9:00 through 2:00 the following morning (i.e. Saturday 9am → Sunday 2am, Sunday 9am → Monday 2am)
 
-Posts a "waking up" / "sleeping" embed to Discord on each transition. Manual `/pause` is independent of
-this schedule and overrides it either way.
+Posts a "waking up" / "sleeping" embed to the **logs channel** (not the alerts channel) on each
+transition, so it never triggers a phone/watch push notification — see "Notification design" below.
+Manual `/pause` is independent of this schedule and overrides it either way.
 
 **Budget check:** one call per 15s only during awake hours ≈ 3,840 calls/day on weekdays, ~4,080 on
 weekends — both comfortably under the 5,000/day limit, with the two big API-cost drivers (redundant
@@ -56,6 +57,7 @@ per-search calls, always-on polling) both eliminated by this redesign.
 - `seen_listings.json` — persisted set of already-alerted item IDs (ephemeral on Render — wiped on redeploy)
 - `market_tracking.json` — item IDs currently active in the broadcast results, for sold/ended detection (ephemeral)
 - `market_sold_log.json` — completed entries (title, price, listed/gone timestamps, duration), capped at 1,000, backs the `/market-trends` page (ephemeral)
+- `runtime_state.json` — persisted eBay API call tally (`total`, `calls_today`, `day_start`) plus a `last_heartbeat` timestamp written every 60s regardless of awake/asleep/paused state. Survives Render free-tier spin-down/spin-up (same disk, same container resuming) — only wiped on an actual redeploy, same caveat as the other state files below. On boot, `last_heartbeat` is used to compute how long the process was actually offline, reported in the startup message.
 - `requirements.txt` — flask, gunicorn==21.2.0, requests, discord.py, tzdata
 - `runtime.txt` — python-3.12.0 (Render may ignore this; use PYTHON_VERSION env var instead)
 - `Procfile` — gunicorn start command with explicit port and logging
@@ -93,7 +95,7 @@ per-search calls, always-on polling) both eliminated by this redesign.
 ## Discord Slash Commands
 | Command | Description |
 |---|---|
-| `/status` | Posts scanner stats embed to main channel (shows RUNNING / PAUSED / SLEEPING) |
+| `/status` | Posts scanner stats embed to the logs channel (shows RUNNING / PAUSED / SLEEPING) |
 | `/echo` | Responds with "echo" — used to verify bot is alive |
 | `/test` | Sends a plain test ping plus 2 sample fake alerts (one 2x16, one 2x32, clearly marked `[TEST]`) to the main channel to verify webhook delivery and embed formatting |
 | `/debug` | Toggles verbose scan logging to logs channel |
@@ -108,12 +110,26 @@ per-search calls, always-on polling) both eliminated by this redesign.
 ## Alert Embeds
 Sent to the main channel via webhook, fired on a background thread so a slow/rate-limited webhook never
 blocks the scan loop. Include: title (linked to listing), price, deal tier label, filter name, and
-listing age (e.g. "4m old") when available from eBay's API.
+listing age (e.g. "4m old") when available from eBay's API. The webhook payload also sets plain
+`content` (`🔔 <title> — $<price>`) alongside the embed, since phone/watch push notification previews
+generally show message content, not embed fields — this keeps title + price readable without opening
+the app.
+
+## Notification design
+Only real finds (alert embeds above) are sent to the main alerts webhook/channel — that's the only
+channel that should have push notifications enabled on your phone. Everything else (server startup,
+Render free-tier restarts, awake/sleep transitions, `/status`) posts to the **logs channel**
+(`DISCORD_LOG_CHANNEL_ID`) via the bot instead, using `_log_embed()` (mirrors `_discord()` but targets
+the logs channel). Mute/silence notifications for the logs channel in Discord's per-channel settings —
+no code change needed to adjust that. The old hourly automatic status ping was removed entirely (it
+added noise without being actionable); `/status` still works on demand and now posts to the logs
+channel.
 
 ## Status Embed
-Sent hourly while awake, and on `/status`. Includes: uptime, scans run, alerts sent, eBay API calls
-today vs 5,000 daily limit, projected 24h usage (turns orange with ⚠️ if on track to exceed limit),
-poll interval, active filter count, and current state (RUNNING / PAUSED / SLEEPING).
+Sent on `/status` only (see "Notification design" above — no longer automatic/hourly). Includes:
+uptime, scans run, alerts sent, eBay API calls today vs 5,000 daily limit, projected 24h usage (turns
+orange with ⚠️ if on track to exceed limit), poll interval, active filter count, and current state
+(RUNNING / PAUSED / SLEEPING).
 
 ## eBay API Notes
 - Uses Browse API (`/buy/browse/v1/item_summary/search`)
@@ -152,9 +168,10 @@ title contains: `ecc`, `server`, `apple`, `mac`, `macbook`, `rdimm`, `lrdimm`, `
 ## Known Limitations
 - `seen_listings.json` is wiped on every Render redeploy — causes a one-time flood of old listings on restart
 - `market_tracking.json` / `market_sold_log.json` are also wiped on redeploy — trend history resets
+- `runtime_state.json` (API call tally + heartbeat) is likewise wiped on redeploy — persists across free-tier spin-down/spin-up, resets on an actual code push
 - `searches.json` edits via Discord commands don't survive redeploys
 - Fix for all of the above: use a persistent database (Redis or SQLite with Render disk)
-- Render free tier may spin down after inactivity
+- Render free tier may spin down after inactivity — the startup message reports how long it was down and whether the awake-hours schedule says it should actually be scanning right now (a restart does not imply "running"; see "Notification design")
 - `SCANNER_TZ` must be set correctly or the awake-hours schedule runs at the wrong clock hours for your location
 - "Sold" on the market trends page is really "disappeared from active results" — see the caveat in that section above
 

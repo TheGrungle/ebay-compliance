@@ -20,12 +20,13 @@ SEARCHES_FILE = "searches.json"
 SEEN_FILE = "seen_listings.json"
 MARKET_TRACKING_FILE = "market_tracking.json"
 MARKET_SOLD_LOG_FILE = "market_sold_log.json"
+RUNTIME_STATE_FILE = "runtime_state.json"
+HEARTBEAT_INTERVAL = 60  # how often the alive-heartbeat is written to disk, in seconds
 MAX_SEEN = 5000
 MAX_SOLD_LOG = 1000
 BROADCAST_LIMIT = 200  # max eBay Browse API allows per call; costs the same 1 API call regardless
 DEFAULT_POLL_INTERVAL = 15
 TOKEN_TTL = 5400
-STATUS_INTERVAL = 3600
 SLEEP_CHECK_INTERVAL = 60  # how often to re-check the clock while asleep/paused
 EBAY_DAILY_LIMIT = 5000
 NO_PRICE = float("inf")  # used when eBay returns no price (always fails max_price check)
@@ -107,6 +108,9 @@ debug_mode = False
 paused = False
 
 # --- eBay API call tracking ---
+# Persisted to disk (unlike SEEN_LISTINGS etc. this is small and cheap to write often) so the tally
+# survives Render free-tier spin-down/spin-up cycles — only a real redeploy wipes it. The persisted
+# "last_heartbeat" timestamp is also how we compute how long the process was actually offline.
 api_calls = {
     "total": 0,
     "timestamps": [],   # rolling window of call times for rate calculation
@@ -114,6 +118,50 @@ api_calls = {
     "calls_today": 0,
 }
 _api_lock = threading.Lock()
+
+def _load_runtime_state():
+    try:
+        with open(RUNTIME_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def _save_runtime_state():
+    with _api_lock:
+        data = {
+            "total": api_calls["total"],
+            "calls_today": api_calls["calls_today"],
+            "day_start": api_calls["day_start"],
+            "last_heartbeat": time.time(),
+        }
+    try:
+        with open(RUNTIME_STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Runtime state save error: {e}")
+
+def _format_duration(secs):
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    hours, rem = divmod(secs, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+# Restore the persisted tally (if any) and figure out how long we were offline before this boot.
+# None means this is the very first run ever (no prior state file to compare against).
+OFFLINE_SECS_ON_BOOT = None
+_prev_state = _load_runtime_state()
+if _prev_state:
+    OFFLINE_SECS_ON_BOOT = max(0, time.time() - _prev_state.get("last_heartbeat", time.time()))
+    api_calls["total"] = _prev_state.get("total", 0)
+    api_calls["calls_today"] = _prev_state.get("calls_today", 0)
+    api_calls["day_start"] = _prev_state.get("day_start", time.time())
+    # Roll the daily counter over if a full day (or more) passed while we were offline.
+    if time.time() - api_calls["day_start"] >= 86400:
+        api_calls["calls_today"] = 0
+        api_calls["day_start"] = time.time()
+_save_runtime_state()  # write immediately so a heartbeat exists even if we crash before the next one
 
 def record_api_call():
     now = time.time()
@@ -128,6 +176,7 @@ def record_api_call():
         # Keep only last 2 hours of timestamps for rate calc
         cutoff = now - 7200
         api_calls["timestamps"] = [t for t in api_calls["timestamps"] if t > cutoff]
+    _save_runtime_state()
 
 def get_api_projection():
     with _api_lock:
@@ -339,6 +388,22 @@ def _log(message):
             print(f"Log send error: {e}")
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
 
+def _log_embed(payload):
+    """Like _discord(), but posts to the logs channel via the bot instead of the alerts webhook.
+       Used for server-lifecycle/status noise (startup, waking/sleeping, /status) so it never
+       triggers a push notification in the alerts channel — only real finds should do that."""
+    if _bot_loop is None:
+        return
+    async def _send():
+        try:
+            ch = bot.get_channel(DISCORD_LOG_CHANNEL_ID)
+            if ch:
+                embeds = [discord.Embed.from_dict(e) for e in payload.get("embeds", [])]
+                await ch.send(content=payload.get("content"), embeds=embeds or None)
+        except Exception as e:
+            print(f"Log embed send error: {e}")
+    asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
+
 # --- Listing age ---
 MAX_LISTING_AGE = 86400  # 24 hours in seconds
 
@@ -375,18 +440,34 @@ def send_startup_message():
         for f in filters
     ) or "No filters configured."
     pid = os.getpid()
-    _discord({
+
+    # Explicitly check (and report) whether the awake-hours schedule says we should actually be
+    # scanning right now — a restart (e.g. Render free-tier spin-up) doesn't mean "running", it just
+    # means the process is alive again; the scan loop still won't call eBay outside awake hours.
+    awake = is_awake()
+    state_line = "🟢 **RUNNING** — inside awake hours, scanning normally." if awake else \
+                 "😴 **SLEEPING** — outside awake hours, will not poll eBay until the next awake window."
+
+    offline_line = ""
+    if OFFLINE_SECS_ON_BOOT is not None:
+        offline_line = f"**Was offline for:** {_format_duration(OFFLINE_SECS_ON_BOOT)}\n\n"
+
+    _log_embed({
         "embeds": [{
             "title": "🟢 eBay Scanner is live",
             "description": (
                 f"**PID: `{pid}`**\n\n"
+                f"{offline_line}"
+                f"**State:** {state_line}\n\n"
                 f"**Broadcast query:** `{broadcast.get('query', '(none)')}` every {broadcast.get('poll_interval', DEFAULT_POLL_INTERVAL)}s\n\n"
-                f"**Filters:**\n{lines}"
+                f"**Filters:**\n{lines}\n\n"
+                f"**API calls today:** {api_calls['calls_today']:,} · **All-time:** {api_calls['total']:,} (persisted across restarts)"
             ),
-            "color": 0x00FF00,
+            "color": 0x00FF00 if awake else 0x2C2F33,
         }]
     })
-    _log(f"🟢 Scanner started (PID {pid}).")
+    offline_note = f" Was offline {_format_duration(OFFLINE_SECS_ON_BOOT)}." if OFFLINE_SECS_ON_BOOT is not None else ""
+    _log(f"🟢 Scanner started (PID {pid}) — {'RUNNING' if awake else 'SLEEPING'}.{offline_note}")
 
 def send_alert(title, price, url, filt, item):
     age = get_listing_age(item)
@@ -400,6 +481,9 @@ def send_alert(title, price, url, filt, item):
         fields.append({"name": "Listed", "value": age, "inline": True})
 
     payload = {
+        # Plain content (not just the embed) so the title + price show up in the push notification
+        # preview itself on phone/watch, which usually don't render embed fields.
+        "content": f"🔔 {title} — ${price:.2f}",
         "embeds": [{
             "title": title,
             "url": url,
@@ -598,7 +682,6 @@ def send_test_feed(entries):
 def scan():
     token = None
     token_time = 0
-    last_status = time.time()
     was_awake = None  # None = not yet determined, forces an initial log line
 
     while True:
@@ -609,11 +692,11 @@ def scan():
             if awake:
                 _log("☀️ Awake hours started — scanner resuming.")
                 if was_awake is not None:
-                    _discord({"embeds": [{"title": "☀️ Scanner waking up", "color": 0xFFD700}]})
+                    _log_embed({"embeds": [{"title": "☀️ Scanner waking up", "color": 0xFFD700}]})
             else:
                 _log("😴 Awake hours ended — scanner sleeping.")
                 if was_awake is not None:
-                    _discord({"embeds": [{"title": "😴 Scanner sleeping until next awake window", "color": 0x2C2F33}]})
+                    _log_embed({"embeds": [{"title": "😴 Scanner sleeping until next awake window", "color": 0x2C2F33}]})
             was_awake = awake
 
         if paused or not awake:
@@ -629,11 +712,6 @@ def scan():
                 _log(f"⚠️ Token error: {e}")
                 time.sleep(15)
                 continue
-
-        if time.time() - last_status >= STATUS_INTERVAL:
-            _discord(build_status_embed())
-            _log("📊 Hourly status posted.")
-            last_status = time.time()
 
         with _config_lock:
             config = load_config()
@@ -807,8 +885,8 @@ async def broadcast_edit(
 
 @tree.command(name="status", description="Get current scanner stats")
 async def status_command(interaction: discord.Interaction):
-    _discord(build_status_embed())
-    await interaction.response.send_message("Status posted!", ephemeral=True)
+    _log_embed(build_status_embed())
+    await interaction.response.send_message("Status posted in logs channel!", ephemeral=True)
 
 @tree.command(name="echo", description="Echo")
 async def echo_command(interaction: discord.Interaction):
@@ -956,9 +1034,18 @@ def api_status():
         },
     })
 
+def heartbeat():
+    """Writes the runtime state (incl. last_heartbeat) on a fixed interval regardless of whether the
+       scanner is awake, asleep, or paused, so offline-duration on the next boot reflects real downtime
+       (e.g. a Render free-tier spin-down) rather than just the scheduled awake-hours sleep gaps."""
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL)
+        _save_runtime_state()
+
 # --- Startup (no blocking calls here) ---
 threading.Thread(target=run_bot, daemon=True).start()
 threading.Thread(target=scan, daemon=True).start()
+threading.Thread(target=heartbeat, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
