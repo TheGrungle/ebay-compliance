@@ -45,6 +45,17 @@ WEEKDAY_END_HOUR = 23
 WEEKEND_START_HOUR = 9
 WEEKEND_END_HOUR = 2  # next calendar day
 
+# --- Persisted JSON state ---
+def _atomic_write_json(path, data, **dump_kwargs):
+    """write-to-temp-then-rename so a process kill mid-write (crash, OOM, Render restart) can never
+       leave a half-written/corrupted file — a corrupted seen_listings.json in particular used to
+       silently reset to an empty set on next load, which is what caused already-alerted items to
+       get re-alerted after a crash."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, **dump_kwargs)
+    os.replace(tmp_path, path)
+
 # --- Env vars ---
 def _require(name):
     val = os.environ.get(name)
@@ -140,8 +151,7 @@ def _save_runtime_state():
             "last_heartbeat": time.time(),
         }
     try:
-        with open(RUNTIME_STATE_FILE, "w") as f:
-            json.dump(data, f)
+        _atomic_write_json(RUNTIME_STATE_FILE, data)
     except Exception as e:
         print(f"Runtime state save error: {e}")
 
@@ -231,8 +241,7 @@ def load_config():
         return {"broadcast": {}, "filters": []}
 
 def save_config(config):
-    with open(SEARCHES_FILE, "w") as f:
-        json.dump(config, f, indent=2)
+    _atomic_write_json(SEARCHES_FILE, config, indent=2)
 
 # --- Seen listings (ordered: dict in Python 3.7+ preserves insertion order, O(1) lookups) ---
 def _load_seen():
@@ -244,9 +253,7 @@ def _load_seen():
         return {}
 
 def _save_seen(seen):
-    items = list(seen.keys())
-    with open(SEEN_FILE, "w") as f:
-        json.dump(items, f)
+    _atomic_write_json(SEEN_FILE, list(seen.keys()))
 
 def _add_seen(item_id):
     SEEN_LISTINGS[item_id] = True
@@ -256,6 +263,16 @@ def _add_seen(item_id):
         del SEEN_LISTINGS[oldest]
 
 SEEN_LISTINGS = _load_seen()
+
+# Set once the boot-time reseed-from-alert-history (see _reseed_seen_from_alert_history) has run, so
+# scan() can hold off on real scanning until it's had a chance to run — a second line of defense
+# against re-alerting already-alerted items, on top of the atomic writes above, that also covers a
+# seen_listings.json fully lost to a container replacement (not just a corrupted write). Bounded by
+# SEED_WAIT_TIMEOUT so a Discord outage can't block actual eBay scanning indefinitely — alerts go out
+# over a webhook, not the bot, so scanning was never meant to depend on the bot being connected.
+_seen_seeded = threading.Event()
+_boot_time = time.time()
+SEED_WAIT_TIMEOUT = 30
 
 # --- Market trend tracking ---
 # MARKET_TRACKING: item_id -> {title, price, created_at, first_seen, matched_filters} for listings
@@ -269,8 +286,7 @@ def _load_market_tracking():
         return {}
 
 def _save_market_tracking(tracking):
-    with open(MARKET_TRACKING_FILE, "w") as f:
-        json.dump(tracking, f)
+    _atomic_write_json(MARKET_TRACKING_FILE, tracking)
 
 def _load_sold_log():
     try:
@@ -280,8 +296,7 @@ def _load_sold_log():
         return []
 
 def _save_sold_log(log):
-    with open(MARKET_SOLD_LOG_FILE, "w") as f:
-        json.dump(log, f)
+    _atomic_write_json(MARKET_SOLD_LOG_FILE, log)
 
 MARKET_TRACKING = _load_market_tracking()
 SOLD_LOG = _load_sold_log()
@@ -421,6 +436,34 @@ async def _last_crash_log_message_at():
     except Exception as e:
         print(f"Crash log history fetch error: {e}")
     return None
+
+async def _reseed_seen_from_alert_history():
+    """Rebuilds SEEN_LISTINGS from the alerts channel's own recent messages on boot, reading the
+       "Item ID" field already embedded in every alert. This is what actually stops a crash/restart
+       from re-alerting items that were already alerted moments earlier — the alerts channel lives on
+       Discord, not local disk, so it survives even a full container replacement that wipes
+       seen_listings.json outright. Always sets _seen_seeded when done (even on failure) so scan()
+       doesn't wait forever."""
+    try:
+        ch = bot.get_channel(DISCORD_CHANNEL_ID)
+        if ch is None:
+            return
+        seeded = 0
+        async for msg in ch.history(limit=200):
+            for embed in msg.embeds:
+                for field in embed.fields:
+                    if field.name == "Item ID":
+                        item_id = (field.value or "").strip("`")
+                        if item_id and item_id not in SEEN_LISTINGS:
+                            _add_seen(item_id)
+                            seeded += 1
+        if seeded:
+            _save_seen(SEEN_LISTINGS)
+        print(f"[PID {os.getpid()}] Reseeded {seeded} already-alerted item(s) from alert history.")
+    except Exception as e:
+        print(f"Alert history reseed error: {e}")
+    finally:
+        _seen_seeded.set()
 
 def _log_embed(payload):
     """Like _discord(), but posts to the logs channel via the bot instead of the alerts webhook.
@@ -754,6 +797,10 @@ def scan():
             time.sleep(SLEEP_CHECK_INTERVAL)
             continue
 
+        if not _seen_seeded.is_set() and time.time() - _boot_time < SEED_WAIT_TIMEOUT:
+            time.sleep(1)
+            continue
+
         if token is None or time.time() - token_time > TOKEN_TTL:
             try:
                 token = get_access_token()
@@ -776,13 +823,19 @@ def scan():
             _log(f"❌ Scan error: {err}")
             _crash_log(f"Scan failed: {err}")
         else:
-            _update_market_tracking(items, filters)
-            new_count, excluded_count, matched_count, test_feed = _process_results(items, filters, broadcast)
-            summary_finds += matched_count
-            if new_count:
-                _save_seen(SEEN_LISTINGS)
-            send_test_feed(test_feed)
-            _crash_log("Scanned and found nothing" if matched_count == 0 else f"Scanned, found {matched_count}")
+            try:
+                _update_market_tracking(items, filters)
+                new_count, excluded_count, matched_count, test_feed = _process_results(items, filters, broadcast)
+                summary_finds += matched_count
+                if new_count:
+                    _save_seen(SEEN_LISTINGS)
+                send_test_feed(test_feed)
+                _crash_log("Scanned and found nothing" if matched_count == 0 else f"Scanned, found {matched_count}")
+            except Exception as e:
+                # A single malformed item/response should never take down the whole scan loop —
+                # log it and keep going instead of silently killing this background thread.
+                _log(f"❌ Scan processing error: {e}")
+                _crash_log(f"Scan processing failed: {e}")
 
         summary_elapsed = time.time() - summary_start
         if summary_elapsed >= SCAN_SUMMARY_INTERVAL:
@@ -1012,6 +1065,7 @@ async def on_ready():
     tree.clear_commands(guild=None)
     await tree.sync()
     print(f"[PID {os.getpid()}] Bot logged in as {bot.user}")
+    await _reseed_seen_from_alert_history()
     threading.Thread(target=send_startup_message, daemon=True).start()
 
 def run_bot():

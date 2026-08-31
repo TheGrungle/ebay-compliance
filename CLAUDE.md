@@ -181,13 +181,38 @@ it, or it got relisted as a new item ID — not only a genuine sale. `BROADCAST_
 Browse API max, same 1 API call either way) specifically to minimize the case where an active item
 just falls off the page due to listing volume rather than actually ending.
 
+## Crash resilience (duplicate-alert prevention)
+A crash/restart used to be able to re-alert items that were already alerted moments before, for two
+compounding reasons, both now addressed:
+- **Corrupted state file:** `_save_seen()`/`save_config()`/etc. used to write JSON directly to the
+  target file; a process kill mid-write (crash, OOM, Render restart) could leave a truncated file,
+  which `_load_seen()` etc. treat as `FileNotFoundError`/`JSONDecodeError` and silently reset to
+  empty — losing the entire seen-listings set. Fixed by `_atomic_write_json()` (write to `<path>.tmp`,
+  then `os.replace()`), used by every persisted JSON save (`seen_listings.json`, `searches.json`,
+  `market_tracking.json`, `market_sold_log.json`, `runtime_state.json`). `os.replace()` is atomic, so
+  a kill mid-write can never leave a half-written file on disk.
+- **Lost local disk entirely:** if a restart replaces the whole container (not just the process),
+  `seen_listings.json` is gone regardless of the write being atomic. `_reseed_seen_from_alert_history()`
+  (called once from `on_ready()`) rebuilds `SEEN_LISTINGS` from the alerts channel's own last 200
+  messages, reading the "Item ID" field every alert embed already carries — the alerts channel lives on
+  Discord, not local disk, so it survives a full container replacement. `scan()` holds off on real
+  scanning (via the `_seen_seeded` event) for up to `SEED_WAIT_TIMEOUT` (30s) to let this finish first,
+  but won't block indefinitely if the bot can't connect — alerts go out over the webhook, not the bot,
+  so scanning was never meant to hard-depend on bot connectivity.
+
+Also hardened: a single malformed item/API response inside the per-cycle processing block (market
+tracking + filter matching) is now caught and logged (`❌ Scan processing error: ...`) instead of
+silently killing the whole `scan()` background thread.
+
 ## Global Exclusions (hardcoded)
 Applied only when `broadcast.category_id` is `170083` (Desktop Memory). Listings are skipped if their
 title contains: `ecc`, `server`, `apple`, `mac`, `macbook`, `rdimm`, `lrdimm`, `for parts`, `parts only`,
 `not working`, `as is`, `ddr5`, `ddr3`, `ddr2`, `sodimm`
 
 ## Known Limitations
-- `seen_listings.json` is wiped on every Render redeploy — causes a one-time flood of old listings on restart
+- `seen_listings.json` is wiped on every Render redeploy — causes a one-time flood of old listings on
+  restart. Re-alerting already-alerted items specifically is now mitigated by the alert-history reseed
+  above, but "seen but never matched a filter" items still show up as if new.
 - `market_tracking.json` / `market_sold_log.json` are also wiped on redeploy — trend history resets
 - `runtime_state.json` (API call tally + heartbeat) is likewise wiped on redeploy — persists across free-tier spin-down/spin-up, resets on an actual code push
 - `searches.json` edits via Discord commands don't survive redeploys
