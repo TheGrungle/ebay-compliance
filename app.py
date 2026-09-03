@@ -106,7 +106,7 @@ MAX_RECENT_ALERTS = 50
 RECENT_ALERTS = []
 _recent_alerts_lock = threading.Lock()
 
-def _record_recent_alert(title, price, url, filt):
+def _record_recent_alert(title, price, url, filt, image_url):
     with _recent_alerts_lock:
         RECENT_ALERTS.append({
             "title": title,
@@ -114,6 +114,7 @@ def _record_recent_alert(title, price, url, filt):
             "url": url,
             "filter": filt.get("label") or filt["name"],
             "alerted_at": datetime.now(timezone.utc).isoformat(),
+            "image_url": image_url,
         })
         del RECENT_ALERTS[:-MAX_RECENT_ALERTS]
 
@@ -561,6 +562,7 @@ def send_startup_message():
 def send_alert(title, price, url, filt, item):
     age = get_listing_age(item)
     item_id = item.get("itemId", "?")
+    image_url = item.get("image", {}).get("imageUrl")
     fields = [
         {"name": "Price",   "value": f"${price:.2f}",                       "inline": True},
         {"name": "Search",  "value": filt.get("label") or filt["name"],     "inline": True},
@@ -569,23 +571,29 @@ def send_alert(title, price, url, filt, item):
     if age:
         fields.append({"name": "Listed", "value": age, "inline": True})
 
+    embed = {
+        "title": title,
+        "url": url,
+        "color": filt.get("color", 0x00BFFF),
+        "fields": fields,
+    }
+    # Listing photos are often more honest than the title (misleading/wrong titles are common) —
+    # show the actual picture right in the alert so a bad match is obvious without opening the link.
+    if image_url:
+        embed["image"] = {"url": image_url}
+
     payload = {
         # Plain content (not just the embed) so the title + price show up in the push notification
         # preview itself on phone/watch, which usually don't render embed fields.
         "content": f"🔔 {title} — ${price:.2f}",
-        "embeds": [{
-            "title": title,
-            "url": url,
-            "color": filt.get("color", 0x00BFFF),
-            "fields": fields,
-        }]
+        "embeds": [embed]
     }
     # Fire-and-forget: a slow/rate-limited webhook must never stall the scan loop.
     threading.Thread(target=_discord, args=(payload,), daemon=True).start()
 
     with _stats_lock:
         stats["alerts_sent"] += 1
-    _record_recent_alert(title, price, url, filt)
+    _record_recent_alert(title, price, url, filt, image_url)
     _log(f"🔔 Alert: [{filt['name']}] {title} — ${price:.2f}" + (f" ({age})" if age else ""))
 
 def build_status_embed():
@@ -1128,6 +1136,8 @@ def api_status():
                 "price": e["price"],
                 "filter": e["filter"],
                 "alerted_secs_ago": secs_ago,
+                "url": e.get("url"),
+                "image_url": e.get("image_url"),
             })
 
     return jsonify({
